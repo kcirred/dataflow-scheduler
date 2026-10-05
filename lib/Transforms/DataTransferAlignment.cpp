@@ -22,11 +22,16 @@
 // spec and rewrites any transfers that violate those constraints, resizing
 // staging buffers and transfer shapes until all transfers are legal.
 //
+// As a separate step, every strided global view is then put in memory order
+// (strides decreasing), with the transfers on it reordered to match, since
+// downstream layout analysis reads views as row-major.
+//
 // Ordering: After stage-coarsening + canonicalize. Before double-buffering.
 //
 //===----------------------------------------------------------------------===//
 
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <numeric>
 
@@ -1221,6 +1226,38 @@ static mlir::FailureOr<llvm::SmallVector<int64_t>> permuteViewToMemoryOrder(
   return order;
 }
 
+/// Reorders one memref side of a transfer, its `sizes` and the results of its
+/// index `map`, by a view's memory `order` (see permuteViewToMemoryOrder).
+static void reorderTransferSide(llvm::ArrayRef<int64_t> order,
+                                llvm::SmallVector<mlir::OpFoldResult>& sizes,
+                                mlir::AffineMap& map) {
+  llvm::SmallVector<mlir::OpFoldResult> new_sizes;
+  llvm::SmallVector<mlir::AffineExpr> results;
+  for (int64_t dim : order) {
+    new_sizes.push_back(sizes[dim]);
+    results.push_back(map.getResult(dim));
+  }
+  sizes = new_sizes;
+  map = mlir::AffineMap::get(map.getNumDims(), map.getNumSymbols(), results,
+                             map.getContext());
+}
+
+/// Replaces `op` with a ktdf.data_transfer on the same operands and indices
+/// but the given index maps and sizes, keeping its discardable attributes.
+static mlir::ktdf::DataTransferOp replaceTransfer(
+    mlir::ktdf::DataTransferOp op, mlir::AffineMap src_map,
+    llvm::ArrayRef<mlir::OpFoldResult> src_sizes, mlir::AffineMap dst_map,
+    llvm::ArrayRef<mlir::OpFoldResult> dst_sizes, mlir::OpBuilder& builder) {
+  builder.setInsertionPoint(op);
+  auto new_op = mlir::ktdf::DataTransferOp::create(
+      builder, op.getLoc(), op.getSource(), src_map, op.getSourceIndices(),
+      src_sizes, op.getDestination(), dst_map, op.getDestIndices(), dst_sizes);
+  for (mlir::NamedAttribute attr : op->getDiscardableAttrs())
+    new_op->setDiscardableAttr(attr.getName(), attr.getValue());
+  op.erase();
+  return new_op;
+}
+
 /// Replaces ts.transfer with a new DataTransferOp widened along view dim p by
 /// pa.alignment_factor.
 ///
@@ -1290,15 +1327,7 @@ static mlir::LogicalResult rewriteTransferShape(
       return op->emitError(PASS_NAME
                            ": memory order of the strided view does not end "
                            "with its contiguous dim");
-    llvm::SmallVector<mlir::OpFoldResult> new_sizes;
-    llvm::SmallVector<mlir::AffineExpr> results;
-    for (int64_t dim : *order) {
-      new_sizes.push_back(sizes[dim]);
-      results.push_back(map.getResult(dim));
-    }
-    sizes = new_sizes;
-    map = mlir::AffineMap::get(map.getNumDims(), map.getNumSymbols(), results,
-                               ctx);
+    reorderTransferSide(*order, sizes, map);
     sizes[rank - 1] = get_scaled(sizes[rank - 1]);
     return mlir::success();
   };
@@ -1307,18 +1336,107 @@ static mlir::LogicalResult rewriteTransferShape(
       mlir::failed(rewrite_side(op.getDestination(), new_dst_sizes, dst_map)))
     return mlir::failure();
 
-  builder.setInsertionPoint(op);
-  auto new_op = mlir::ktdf::DataTransferOp::create(
-      builder, op.getLoc(), op.getSource(), src_map, op.getSourceIndices(),
-      new_src_sizes, op.getDestination(), dst_map, op.getDestIndices(),
-      new_dst_sizes);
-
-  for (mlir::NamedAttribute attr : op->getDiscardableAttrs())
-    new_op->setDiscardableAttr(attr.getName(), attr.getValue());
-
+  auto new_op = replaceTransfer(op, src_map, new_src_sizes, dst_map,
+                                new_dst_sizes, builder);
   LDBG(1) << "  rewriteTransferShape: widened dim " << pa.perm_p
           << " by factor " << pa.alignment_factor << ": " << new_op;
-  op.erase();
+  return mlir::success();
+}
+
+/// Returns true if `construct` is a global view whose static strides do not
+/// already list its dims in memory order, and whose only consumers are
+/// view-like casts and transfers (so it can be reordered).
+static bool needsMemoryOrder(
+    mlir::ktdp::ConstructMemoryViewOp construct,
+    const scheduler::arch_view::MemoryTree& memory_tree) {
+  if (isPerCoreScratchpad(construct.getResult(), memory_tree)) return false;
+  llvm::ArrayRef<int64_t> shape = construct.getStaticSizes();
+  llvm::ArrayRef<int64_t> strides = construct.getStaticStrides();
+  if (llvm::any_of(shape, mlir::ShapedType::isDynamic) ||
+      llvm::any_of(strides, mlir::ShapedType::isDynamic))
+    return false;
+  // In memory order when the strides never increase going inwards; unit dims
+  // never move, so their stride is irrelevant.
+  int64_t prev = std::numeric_limits<int64_t>::max();
+  bool ordered = true;
+  for (auto [size, stride] : llvm::zip(shape, strides)) {
+    if (size == 1) continue;
+    if (stride > prev) ordered = false;
+    prev = stride;
+  }
+  if (ordered) return false;
+
+  llvm::SmallVector<mlir::Value> worklist = {construct.getResult()};
+  while (!worklist.empty()) {
+    mlir::Value v = worklist.pop_back_val();
+    for (mlir::Operation* user : v.getUsers()) {
+      if (mlir::isa<mlir::ktdf::DataTransferOp>(user)) continue;
+      if (!mlir::isa<mlir::memref::CastOp, mlir::memref::MemorySpaceCastOp>(
+              user))
+        return false;
+      worklist.push_back(user->getResult(0));
+    }
+  }
+  return true;
+}
+
+/// Reorders into memory order every strided global view that fixPipeline did
+/// not already reorder, together with the transfers on it.
+///
+/// Downstream layout analysis reads a view's strides as decreasing, so a view
+/// whose outer dims are out of memory order cannot be lowered even when every
+/// transfer on it is legal — e.g. a transpose that only exchanges outer dims
+/// and keeps the contiguous dim innermost. Reordering only renames which index
+/// slot addresses which buffer dim (see permuteViewToMemoryOrder), so the
+/// transfers move the same elements; nothing is widened.
+static mlir::LogicalResult reorderViewsToMemoryOrder(
+    mlir::Operation* root, const scheduler::arch_view::MemoryTree& memory_tree,
+    llvm::DenseMap<mlir::Operation*, llvm::SmallVector<int64_t>>& view_orders,
+    mlir::OpBuilder& builder) {
+  llvm::DenseMap<mlir::Operation*, llvm::SmallVector<int64_t>> new_orders;
+  mlir::WalkResult walk =
+      root->walk([&](mlir::ktdp::ConstructMemoryViewOp construct) {
+        if (view_orders.contains(construct.getOperation()) ||
+            !needsMemoryOrder(construct, memory_tree))
+          return mlir::WalkResult::advance();
+        auto order = permuteViewToMemoryOrder(construct, construct);
+        if (mlir::failed(order)) return mlir::WalkResult::interrupt();
+        new_orders.try_emplace(construct.getOperation(), *order);
+        return mlir::WalkResult::advance();
+      });
+  if (walk.wasInterrupted()) return mlir::failure();
+  if (new_orders.empty()) return mlir::success();
+
+  llvm::SmallVector<mlir::ktdf::DataTransferOp> transfers;
+  root->walk([&](mlir::ktdf::DataTransferOp op) { transfers.push_back(op); });
+  for (mlir::ktdf::DataTransferOp op : transfers) {
+    auto order_of = [&](mlir::Value val) -> const llvm::SmallVector<int64_t>* {
+      auto construct = findConstructMemoryView(val, memory_tree);
+      if (!construct) return nullptr;
+      auto it = new_orders.find(construct.getOperation());
+      return it == new_orders.end() ? nullptr : &it->second;
+    };
+    auto src_order = op.isSourceMemRef() ? order_of(op.getSource()) : nullptr;
+    auto dst_order =
+        op.isDestMemRef() ? order_of(op.getDestination()) : nullptr;
+    if (!src_order && !dst_order) continue;
+
+    auto src_sizes = op.getMixedSourceSizes();
+    auto dst_sizes = op.getMixedDestSizes();
+    mlir::AffineMap src_map = op.isSourceMemRef()
+                                  ? op.getSourceMapAttr().getValue()
+                                  : mlir::AffineMap{};
+    mlir::AffineMap dst_map =
+        op.isDestMemRef() ? op.getDestMapAttr().getValue() : mlir::AffineMap{};
+    if (src_order) reorderTransferSide(*src_order, src_sizes, src_map);
+    if (dst_order) reorderTransferSide(*dst_order, dst_sizes, dst_map);
+    auto new_op =
+        replaceTransfer(op, src_map, src_sizes, dst_map, dst_sizes, builder);
+    LDBG(1) << "  reorderViewsToMemoryOrder: " << new_op;
+  }
+
+  for (auto& [construct, order] : new_orders)
+    view_orders.try_emplace(construct, order);
   return mlir::success();
 }
 
@@ -1614,6 +1732,12 @@ struct DataTransferAlignmentPass
         return;
       }
     }
+
+    // Separately from alignment: every remaining strided global view must
+    // also reach the downstream layout analysis in memory order.
+    if (mlir::failed(reorderViewsToMemoryOrder(getOperation(), memory_tree,
+                                               view_orders, builder)))
+      signalPassFailure();
   }
 
  private:

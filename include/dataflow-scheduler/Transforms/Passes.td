@@ -572,6 +572,10 @@ def DataTransferAlignmentPass : Pass<"data-transfer-alignment", "mlir::ModuleOp"
     spec and rewrites any transfers that violate those constraints, resizing
     staging buffers and transfer shapes until all transfers are legal.
 
+    As a separate step, every strided global view is then put in memory order
+    (strides decreasing), with the transfers on it reordered to match, since
+    downstream layout analysis reads views as row-major.
+
     Must run after stage-coarsening + canonicalize and before double-buffering.
   }];
   let constructor = "::scheduler::createDataTransferAlignmentPass()";
