@@ -13,18 +13,19 @@
 // CHECK:        scf.for %[[ARG0:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
 // CHECK:          ktdf.data_transfer from %{{.*}} size [1, 64, 64] to %[[PRIV]]#0[%[[ARG0]], 0, 0, 0] size [1, 1, 64, 64]
 
-// Middle Stage: nested pipeline wrapped with element loops for scalar processing
+// Middle Stage: nested pipeline wrapped with element loops for scalar
+// processing; the element transfers keep the block index of the stage loop
 // CHECK:      ktdf.stage
 // CHECK:        scf.for %[[ARG0:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
 // CHECK:          scf.for %[[ARG1:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
 // CHECK:            scf.for %[[ARG2:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
 // CHECK:              ktdf.pipeline {
 // CHECK:                ktdf.stage {{.*}} {
-// CHECK:                  ktdf.data_transfer from %[[PRIV]]#0[0, 0, %[[ARG1]], %[[ARG2]]] size [1, 1, 1, 1] to %{{.*}} size [64] {transfer_mode = "splat"}
+// CHECK:                  ktdf.data_transfer from %[[PRIV]]#0[%[[ARG0]], 0, %[[ARG1]], %[[ARG2]]] size [1, 1, 1, 1] to %{{.*}} size [64] {transfer_mode = "splat"}
 // CHECK:                }
 // CHECK:                ktdf.stage
 // CHECK:                ktdf.stage {{.*}} {
-// CHECK:                  ktdf.data_transfer from %{{.*}} size [64] to %[[PRIV]]#1[0, 0, %[[ARG2]], %[[ARG1]]] size [1, 1, 1, 1] {transfer_mode = "lane0"}
+// CHECK:                  ktdf.data_transfer from %{{.*}} size [64] to %[[PRIV]]#1[%[[ARG0]], 0, %[[ARG2]], %[[ARG1]]] size [1, 1, 1, 1] {transfer_mode = "lane0"}
 // CHECK:                }
 // CHECK:              }
 

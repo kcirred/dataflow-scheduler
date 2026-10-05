@@ -1,9 +1,9 @@
 // RUN: dataflow-scheduler-opt -pass-pipeline="builtin.module(ktdflowering-to-dfir)" %s | FileCheck %s
 
 // Verify that ktdf.data_transfer with transfer_mode="lane0" produces:
-//   1. dataflow.receive with the SOURCE FIFO slot size vector (not dest size)
-//   2. vectorchain.shuffle taking lane 0 down to one element
-//   3. agen.vector_store of that one lane at the destination indices, with a
+//   1. dataflow.receive of only the one destination element, with no
+//      vectorchain.shuffle to narrow the full FIFO slot
+//   2. agen.vector_store of that one lane at the destination indices, with a
 //      one-element store_set
 
 // CHECK:       #[[$SET:.+]] = affine_set<(d0, d1, d2, d3) : (d0 == 0, d1 == 0, d2 == 0, d3 == 0)>
@@ -11,11 +11,11 @@
 // CHECK:         dataflow.program_unit
 // CHECK:           scf.for %[[ROW:.+]] = %{{.+}} to %{{.+}} step %{{.+}} {
 // CHECK-NEXT:        scf.for %[[COL:.+]] = %{{.+}} to %{{.+}} step %{{.+}} {
-// CHECK:               %[[RECV:.+]] = dataflow.receive %{{.+}} : vector<64xf16>
-// CHECK-NEXT:          %[[LANE:.+]] = vectorchain.shuffle input(%[[RECV]]) {indices = [0 : i32], repetition = 1 : i32} : vector<64xf16>, vector<1xf16>
-// CHECK-NEXT:          agen.vector_store %[[LANE]], %{{.+}}[0, 0, %[[COL]], %[[ROW]]]
+// CHECK:               %[[RECV:.+]] = dataflow.receive %{{.+}} : vector<1xf16>
+// CHECK-NEXT:          agen.vector_store %[[RECV]], %{{.+}}[0, 0, %[[COL]], %[[ROW]]]
 // CHECK-SAME:            store_set = #[[$SET]]
 // CHECK-SAME:            : memref<1x1x64x64xf16, "L1">, vector<1xf16>
+// CHECK-NOT:         vectorchain.shuffle
 
 module {
   ktdf_arch.device @sample_device attributes {} import("../../../../Dialect/KTDFArch/sample_device.mlir")

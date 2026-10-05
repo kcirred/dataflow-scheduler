@@ -2,19 +2,36 @@
 
 // CHECK-LABEL: func.func @local_schedule_0()
 
-// Staging allocs reshaped to memref<?x?x1x64x64xf16, "L1">:
+// The strided input view is read through the transposition of its contiguous
+// dim (d1, stride 1) and its lane (d2): their strides are exchanged.
+// CHECK:      ktdp.construct_memory_view %{{.*}}, sizes: [12, 64, 64], strides: [4096, 64, 1]
+
+// The tile of the aligned dimension is constrained to whole 64-element blocks,
+// so tile size selection cannot split one:
+// CHECK:      %[[TS0:.*]] = ktdf.tiling.reserve_size {divisibility = 1 : index, min_value = 1 : index}
+// CHECK:      %[[TS1:.*]] = ktdf.tiling.reserve_size {divisibility = 64 : index, min_value = 64 : index}
+
+// Staging allocs reshaped to memref<?x?x1x64x64xf16, "L1">, one 64x64 block per
+// 64 points of the aligned tile:
 // CHECK:      %[[PRIV:.*]]:4 = ktdf.private -> (memref<?x?x1x64x64xf16, "L1">, memref<?x?x1x64x64xf16, "L1">, !ktdf.token, !ktdf.token) {
-// CHECK-DAG:    %[[A0:.*]] = memref.alloc(%{{.*}}, %{{.*}}) : memref<?x?x1x64x64xf16, "L1">
-// CHECK-DAG:    %[[A1:.*]] = memref.alloc(%{{.*}}, %{{.*}}) : memref<?x?x1x64x64xf16, "L1">
+// CHECK:        %[[NB0:.*]] = arith.divui %[[TS1]], %{{.*}} : index
+// CHECK-NEXT:   %[[A0:.*]] = memref.alloc(%[[TS0]], %[[NB0]]) : memref<?x?x1x64x64xf16, "L1">
+// CHECK:        %[[NB1:.*]] = arith.divui %[[TS1]], %{{.*}} : index
+// CHECK-NEXT:   %[[A1:.*]] = memref.alloc(%[[TS0]], %[[NB1]]) : memref<?x?x1x64x64xf16, "L1">
 // CHECK:        ktdf.private_yield %[[A0]], %[[A1]]
 
-// MNILU Stage: loop bound adjusted to 1, transfer widened to [1, 64, 64]
+// MNILU Stage: per-tile trip count divided by 64, each iteration advances one
+// 64-point block, transfer widened to [1, 64, 64]. On the swapped view the
+// block index of d1 moves to d2 with its stride.
 // CHECK:      ktdf.stage
 // CHECK:        scf.for %[[ARG2:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
-// CHECK:          scf.for %[[ARG3:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
-// CHECK:            ktdf.data_transfer from %{{.*}} size [1, 64, 64] to %[[PRIV]]#0[%[[ARG2]], %[[ARG3]], 0, 0, 0] size [1, 1, 1, 64, 64]
+// CHECK:          %[[NB:.*]] = arith.divui %{{.*}}, %{{.*}} : index
+// CHECK-NEXT:     scf.for %[[ARG3:.*]] = %{{.*}} to %[[NB]] step %{{.*}} {
+// CHECK:            %[[IDX:.*]] = ktdf.tiling.linearize_index [%{{.*}} : %[[TS1]]], [%[[ARG3]] : %c64{{.*}}] : index
+// CHECK-NEXT:       ktdf.data_transfer from %{{.*}}[%{{.*}}, %{{.*}}, %[[IDX]]] size [1, 64, 64] to %[[PRIV]]#0[%[[ARG2]], %[[ARG3]], 0, 0, 0] size [1, 1, 1, 64, 64]
 
-// Middle Stage: nested pipeline wrapped with element loops for scalar processing
+// Middle Stage: nested pipeline wrapped with element loops for scalar
+// processing; the element transfers keep the block indices of the stage loops
 // CHECK:      ktdf.stage
 // CHECK:        scf.for %[[ARG2:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
 // CHECK:          scf.for %[[ARG3:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
@@ -22,11 +39,11 @@
 // CHECK:              scf.for %[[ARG5:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
 // CHECK:                ktdf.pipeline {
 // CHECK:                  ktdf.stage {{.*}} {
-// CHECK:                    ktdf.data_transfer from %[[PRIV]]#0[0, 0, 0, %[[ARG4]], %[[ARG5]]] size [1, 1, 1, 1, 1] to %{{.*}} size [64] {transfer_mode = "splat"}
+// CHECK:                    ktdf.data_transfer from %[[PRIV]]#0[%[[ARG2]], %[[ARG3]], 0, %[[ARG4]], %[[ARG5]]] size [1, 1, 1, 1, 1] to %{{.*}} size [64] {transfer_mode = "splat"}
 // CHECK:                  }
 // CHECK:                  ktdf.stage
 // CHECK:                  ktdf.stage {{.*}} {
-// CHECK:                    ktdf.data_transfer from %{{.*}} size [64] to %[[PRIV]]#1[0, 0, 0, %[[ARG5]], %[[ARG4]]] size [1, 1, 1, 1, 1] {transfer_mode = "lane0"}
+// CHECK:                    ktdf.data_transfer from %{{.*}} size [64] to %[[PRIV]]#1[%[[ARG2]], %[[ARG3]], 0, %[[ARG5]], %[[ARG4]]] size [1, 1, 1, 1, 1] {transfer_mode = "lane0"}
 // CHECK:                  }
 // CHECK:                }
 // CHECK:              }
@@ -34,11 +51,14 @@
 // CHECK:          }
 // CHECK:        }
 
-// MNISU Stage: loop bound adjusted to 1, transfer widened to [1, 64, 64]
+// MNISU Stage: per-tile trip count divided by 64, each iteration advances one
+// 64-point block, transfer widened to [1, 64, 64]
 // CHECK:      ktdf.stage
 // CHECK:        scf.for %[[ARG2:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
-// CHECK:          scf.for %[[ARG3:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
-// CHECK:            ktdf.data_transfer from %[[PRIV]]#1[%[[ARG2]], %[[ARG3]], 0, 0, 0] size [1, 1, 1, 64, 64] to %{{.*}} size [1, 64, 64]
+// CHECK:          %[[NB:.*]] = arith.divui %{{.*}}, %{{.*}} : index
+// CHECK-NEXT:     scf.for %[[ARG3:.*]] = %{{.*}} to %[[NB]] step %{{.*}} {
+// CHECK:            %[[IDX:.*]] = ktdf.tiling.linearize_index [%{{.*}} : %[[TS1]]], [%[[ARG3]] : %c64{{.*}}] : index
+// CHECK-NEXT:       ktdf.data_transfer from %[[PRIV]]#1[%[[ARG2]], %[[ARG3]], 0, 0, 0] size [1, 1, 1, 64, 64] to %{{.*}}[%{{.*}}, %[[IDX]], %{{.*}}] size [1, 64, 64]
 
 #set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 11 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 

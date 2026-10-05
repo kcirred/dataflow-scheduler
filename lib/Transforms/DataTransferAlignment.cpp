@@ -26,7 +26,9 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <algorithm>
 #include <memory>
+#include <numeric>
 
 #include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
 #include "dataflow-scheduler/Analysis/Utils.h"
@@ -36,6 +38,9 @@
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -45,6 +50,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/Pass/Pass.h"
 
@@ -83,7 +89,7 @@ class DataTransferLegality {
     llvm::SmallVector<TransferStep>
         transfers;  // empty when nested_pipeline is set
     mlir::scf::ForOp
-        innermost_loop;  // innermost scf.for enclosing the transfers
+        innermost_loop;  // point loop of p in this stage (set by fixPipeline)
   };
 
   /// Whether the pass needs to widen transfers to cover a full contiguous
@@ -93,6 +99,13 @@ class DataTransferLegality {
   /// Root node of a per-pipeline analysis tree. Shared parameters
   /// (alignment_kind, align_dim, alignment_factor) are stored here so all child
   /// nodes can read them directly.
+  ///
+  /// The strided global view indexes a contiguous buffer through a permutation
+  /// of its dims. A transfer moves along the view's last dim q, and is illegal
+  /// because q is not the buffer's contiguous dim p (the stride-1 dim). Every
+  /// rewrite is the transposition of p and q: the load reads blocks with p
+  /// innermost, the LX stage exchanges p and q, the store writes blocks with q
+  /// innermost. All other dims are untouched.
   struct PipelineAnalysis {
     mlir::ktdf::PipelineOp pipeline;
     llvm::SmallVector<mlir::memref::AllocOp>
@@ -100,8 +113,14 @@ class DataTransferLegality {
     AlignmentKind alignment_kind = AlignmentKind::Widen;
     int64_t align_dim = -1;  // which dim to align, offset from end
     int64_t alignment_factor =
-        0;  // factor to multiply the data transfer size by on align_dim
-    int64_t stride_elems = 0;  // full contiguous block extent in elements
+        0;  // factor to multiply the data transfer size by on dim p
+    int64_t stride_elems = 0;  // stride of q in the strided view, in elements
+    int64_t perm_p = -1;       // view dim with stride 1 (the buffer's lane)
+    int64_t perm_q = -1;       // view's innermost dim (the transfer's lane)
+    int64_t view_rank = 0;     // rank of the strided global view
+    int64_t block_elems = 0;   // extent of p: one aligned block per transfer
+    int64_t lx_tile_pos = -1;  // staging-buffer dim indexed by p's point loop
+    bool has_error = false;    // analysis emitted an error; the pass must fail
     llvm::SmallVector<StageAnalysis> stages;  // one entry per ktdf.stage
   };
 
@@ -205,41 +224,14 @@ class DataTransferLegality {
           pa.align_dim = 0;
           pa.alignment_factor = 1;
         } else {
-          // Widen: the non-contiguous innermost stride tells us the total span
-          // of the strided operand in elements. Each transfer iteration already
-          // covers elems_per_iter (the innermost transfer size), so the number
-          // of loop iterations — and hence the loop bound E — is stride /
-          // elems_per_iter. Use inherited_strides when set (nested pipeline
-          // case), otherwise read the stride directly from the strided memref
-          // layout.
-          int64_t stride_elems = 1;
-          if (!inherited_strides.empty()) {
-            stride_elems = inherited_strides.back();
-          } else {
-            auto stride = innermostStride(strided_memref);
-            if (!mlir::failed(stride)) stride_elems = *stride;
-          }
-
-          // Elements covered per loop iteration = the transfer size at
-          // align_dim (offset 1 from the end, i.e. sizes[rank-2]). E =
-          // stride_elems / elems_per_iter gives the number of iterations needed
-          // to cover one full contiguous block.
-          int64_t elems_per_iter = 1;
-          auto sizes = use_dest ? dt.getStaticDestSizesArray()
-                                : dt.getStaticSourceSizesArray();
-          if (sizes) {
-            // align_dim=1 → index from end = 1 → absolute index = rank-2
-            int64_t rank = (int64_t)sizes->size();
-            int64_t idx = rank - 1 - 1;  // rank - 1 - align_dim(=1)
-            if (idx >= 0 && idx < rank)
-              elems_per_iter = std::max<int64_t>(1, (*sizes)[idx]);
-          }
-
-          // align_dim=1 means the second-to-last dimension (offset 1 from end).
-          pa.alignment_kind = AlignmentKind::Widen;
-          pa.align_dim = 1;
-          pa.stride_elems = stride_elems;
-          pa.alignment_factor = stride_elems / elems_per_iter;
+          // Widen: find the buffer's contiguous dim p (stride 1) and the
+          // transfer's lane q (the view's innermost dim). A contiguous block
+          // runs n_p elements along p; each transfer currently covers
+          // elems_per_iter of them, so it must be widened by
+          // n_p / elems_per_iter.
+          if (mlir::failed(
+                  analyzePermutation(pa, dt, strided_memref, use_dest)))
+            pa.has_error = true;
         }
         break;
       }
@@ -274,6 +266,115 @@ class DataTransferLegality {
   }
 
  private:
+  /// Fills pa's Widen parameters from the illegal transfer `dt`, whose strided
+  /// global operand (its destination when `use_dest`, otherwise its source)
+  /// has type `strided_memref`.
+  mlir::LogicalResult analyzePermutation(PipelineAnalysis& pa,
+                                         mlir::ktdf::DataTransferOp dt,
+                                         mlir::MemRefType strided_memref,
+                                         bool use_dest) {
+    llvm::SmallVector<int64_t> strides;
+    int64_t offset;
+    if (mlir::failed(strided_memref.getStridesAndOffset(strides, offset)))
+      return dt->emitError(PASS_NAME ": strided operand has no strided layout");
+    llvm::ArrayRef<int64_t> shape = strided_memref.getShape();
+    int64_t rank = (int64_t)shape.size();
+
+    // p: the buffer's contiguous dim. Unit dims never move, so their stride is
+    // irrelevant and they are not candidates.
+    int64_t p = -1;
+    for (int64_t k = 0; k < rank; ++k) {
+      if (strides[k] != 1 || shape[k] == 1) continue;
+      if (p != -1)
+        return dt->emitError(PASS_NAME
+                             ": strided operand has more than one stride-1 "
+                             "dim");
+      p = k;
+    }
+    int64_t q = rank - 1;
+    if (p == -1)
+      return dt->emitError(PASS_NAME ": strided operand has no stride-1 dim");
+    if (p == q)
+      return dt->emitError(PASS_NAME
+                           ": transfer lane is already the contiguous dim");
+    // Exchanging p and q keeps the view's shape only when they have the same
+    // extent; the LX transpose also needs a square block.
+    if (shape[p] != shape[q])
+      return dt->emitError(PASS_NAME ": contiguous dim (extent ")
+             << shape[p] << ") and transfer lane (extent " << shape[q]
+             << ") must have the same extent to be exchanged";
+
+    auto sizes = use_dest ? dt.getStaticDestSizesArray()
+                          : dt.getStaticSourceSizesArray();
+    if (!sizes) return dt->emitError(PASS_NAME ": transfer has dynamic sizes");
+    int64_t elems_per_iter = std::max<int64_t>(1, (*sizes)[p]);
+    if (shape[p] % elems_per_iter != 0)
+      return dt->emitError(PASS_NAME
+                           ": transfer size along the contiguous dim (")
+             << elems_per_iter << ") does not divide its extent (" << shape[p]
+             << ")";
+    if ((*sizes)[q] != shape[q])
+      return dt->emitError(PASS_NAME
+                           ": transfer must cover the whole transfer lane");
+
+    auto lx_tile_pos = findStagingTilePos(dt, use_dest, p);
+    if (mlir::failed(lx_tile_pos)) return mlir::failure();
+
+    pa.alignment_kind = AlignmentKind::Widen;
+    pa.align_dim = rank - 1 - p;
+    pa.perm_p = p;
+    pa.perm_q = q;
+    pa.view_rank = rank;
+    pa.block_elems = shape[p];
+    pa.stride_elems = strides[q];
+    pa.alignment_factor = shape[p] / elems_per_iter;
+    pa.lx_tile_pos = *lx_tile_pos;
+    return mlir::success();
+  }
+
+  /// Returns the staging-buffer dim indexed by the point loop of view dim `p`:
+  /// the loop IV behind dt's global index at `p` (directly, or as the point IV
+  /// of a ktdf.tiling.linearize_index), located among the indices of dt's
+  /// other (staging) operand.
+  mlir::FailureOr<int64_t> findStagingTilePos(mlir::ktdf::DataTransferOp dt,
+                                              bool global_is_dest, int64_t p) {
+    if (!dt.isSourceMemRef() || !dt.isDestMemRef())
+      return dt->emitError(PASS_NAME
+                           ": illegal transfer must be memref to memref");
+    mlir::AffineMap global_map = global_is_dest
+                                     ? dt.getDestMapAttr().getValue()
+                                     : dt.getSourceMapAttr().getValue();
+    mlir::OperandRange global_indices =
+        global_is_dest ? dt.getDestIndices() : dt.getSourceIndices();
+    mlir::AffineMap staging_map = global_is_dest
+                                      ? dt.getSourceMapAttr().getValue()
+                                      : dt.getDestMapAttr().getValue();
+    mlir::OperandRange staging_indices =
+        global_is_dest ? dt.getSourceIndices() : dt.getDestIndices();
+
+    auto global_dim =
+        mlir::dyn_cast<mlir::AffineDimExpr>(global_map.getResult(p));
+    if (!global_dim)
+      return dt->emitError(PASS_NAME
+                           ": global index along the contiguous dim is not a "
+                           "plain index");
+    mlir::Value iv = global_indices[global_dim.getPosition()];
+    if (auto linearize = iv.getDefiningOp<mlir::ktdf::TilingLinearizeIndexOp>())
+      iv = linearize.getIvs().back();
+    if (!mlir::scf::getForInductionVarOwner(iv))
+      return dt->emitError(PASS_NAME
+                           ": global index along the contiguous dim is not "
+                           "driven by a loop");
+
+    for (auto [pos, expr] : llvm::enumerate(staging_map.getResults())) {
+      auto dim = mlir::dyn_cast<mlir::AffineDimExpr>(expr);
+      if (dim && staging_indices[dim.getPosition()] == iv) return (int64_t)pos;
+    }
+    return dt->emitError(PASS_NAME
+                         ": the contiguous dim's loop does not index the "
+                         "staging buffer");
+  }
+
   /// Returns the single applicable unit kind for the stage enclosing `op`,
   /// stopping at any PipelineOp boundary. Returns nullptr if the stage has
   /// zero or more than one unit.
@@ -549,20 +650,8 @@ class DataTransferLegality {
       PipelineAnalysis stub{};
       stub.pipeline = nested_pipeline;
       sa.nested_pipeline = std::make_unique<PipelineAnalysis>(std::move(stub));
-      // Also find the innermost loop enclosing the nested pipeline — it needs
-      // to be collapsed to ub=1 just like leaf stage loops, so that the only
-      // column iteration is the loop inserted by insertLoopAroundPipeline.
-      stage->walk<mlir::WalkOrder::PreOrder>([&](mlir::scf::ForOp forOp) {
-        if (!nested_pipeline->isAncestor(forOp)) sa.innermost_loop = forOp;
-      });
       return sa;
     }
-
-    // Find the innermost scf.for enclosing the transfers in this stage.
-    // PreOrder visits outer-to-inner; no interrupt() means the last
-    // assignment wins, leaving innermost_loop as the innermost ForOp.
-    stage->walk<mlir::WalkOrder::PreOrder>(
-        [&](mlir::scf::ForOp forOp) { sa.innermost_loop = forOp; });
 
     // Leaf stage: collect every data_transfer op.
     stage->walk([&](mlir::ktdf::DataTransferOp dt) {
@@ -652,6 +741,9 @@ static llvm::raw_ostream& printPipelineAnalysis(
   os << indent << "  align_dim=" << pa.align_dim << "\n";
   os << indent << "  alignment_factor=" << pa.alignment_factor << "\n";
   os << indent << "  stride_elems=" << pa.stride_elems << "\n";
+  os << indent << "  perm_p=" << pa.perm_p << " perm_q=" << pa.perm_q
+     << " view_rank=" << pa.view_rank << " block_elems=" << pa.block_elems
+     << " lx_tile_pos=" << pa.lx_tile_pos << "\n";
   if (pa.allocs.empty()) {
     os << indent << "  allocs=<none>\n";
   } else {
@@ -691,8 +783,8 @@ static bool isPerCoreScratchpad(
   return memory_tree.isPerCoreScratchPadMemory(kind);
 }
 
-/// Widens any ct_local alloc backing a source or destination of `ts` at
-/// pa.align_dim by pa.alignment_factor. Non-ct_local sides are skipped.
+/// Widens any ct_local alloc backing a source or destination of `ts` along
+/// view dim p by pa.alignment_factor. Non-ct_local sides are skipped.
 static void widenAlloc(const DataTransferLegality::TransferStep& ts,
                        const DataTransferLegality::PipelineAnalysis& pa,
                        const scheduler::arch_view::MemoryTree& memory_tree,
@@ -739,34 +831,41 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
     mlir::MemRefType orig_type = alloc.getType();
     llvm::SmallVector<int64_t> new_shape(orig_type.getShape());
 
-    // Convert offset-from-end to an absolute index into the alloc shape.
-    int64_t alloc_dim = (int64_t)orig_type.getRank() - 1 - pa.align_dim;
-    if (alloc_dim < 0 || alloc_dim >= (int64_t)orig_type.getRank()) {
-      ts.transfer->emitError("widenAlloc: align_dim ")
-          << alloc_dim << " is out of range for alloc rank "
-          << orig_type.getRank();
+    // The staging buffer is the transfer's block shape (one dim per view dim,
+    // trailing) behind its tile dims. Widen the block along p, and shrink p's
+    // tile dim (pa.lx_tile_pos) by the same factor: each slot now holds
+    // alignment_factor of p's points, and adjustLoopBounds makes p's tile a
+    // multiple of alignment_factor.
+    int64_t rank = orig_type.getRank();
+    int64_t alloc_dim = rank - pa.view_rank + pa.perm_p;
+    int64_t tile_dim = pa.lx_tile_pos;
+    if (alloc_dim < 0 || alloc_dim >= rank || tile_dim < 0 ||
+        tile_dim >= alloc_dim) {
+      ts.transfer->emitError("widenAlloc: staging buffer of rank ")
+          << rank << " has no block dim for p (" << alloc_dim
+          << ") behind its tile dim (" << tile_dim << ")";
       return;
     }
 
     llvm::SmallVector<mlir::Value> new_dynamic_sizes(alloc.getDynamicSizes());
-
-    if (orig_type.getNumDynamicDims() > 0 && !new_dynamic_sizes.empty()) {
+    if (orig_type.isDynamicDim(tile_dim)) {
       builder.setInsertionPoint(alloc);
-      mlir::Value c1 =
-          mlir::arith::ConstantIndexOp::create(builder, alloc.getLoc(), 1)
-              .getResult();
-      new_dynamic_sizes.back() = c1;
+      mlir::Value c_factor = mlir::arith::ConstantIndexOp::create(
+                                 builder, alloc.getLoc(), alignment_factor)
+                                 .getResult();
+      mlir::Value& tile_size =
+          new_dynamic_sizes[orig_type.getDynamicDimIndex(tile_dim)];
+      tile_size = mlir::arith::DivUIOp::create(builder, alloc.getLoc(),
+                                               tile_size, c_factor)
+                      .getResult();
     } else {
-      if (new_shape[alloc_dim] == new_shape[alloc_dim] * alignment_factor)
-        return;
-
-      if (new_shape[0] % alignment_factor != 0) {
-        ts.transfer->emitError("widenAlloc: outermost dimension (")
-            << new_shape[0] << ") is not divisible by alignment factor "
+      if (new_shape[tile_dim] % alignment_factor != 0) {
+        ts.transfer->emitError("widenAlloc: tile dimension (")
+            << new_shape[tile_dim] << ") is not divisible by alignment factor "
             << alignment_factor;
         return;
       }
-      new_shape[0] = new_shape[0] / alignment_factor;
+      new_shape[tile_dim] = new_shape[tile_dim] / alignment_factor;
     }
 
     int64_t widened_dim = new_shape[alloc_dim] * alignment_factor;
@@ -805,8 +904,187 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
   try_widen(dt.getSource());
 }
 
-/// Reduces sa.innermost_loop upper bound by pa.alignment_factor after verifying
-/// that the loop's total_size operand is divisible by pa.alignment_factor.
+/// Returns the point loop of view dim p in `stage`: the scf.for whose IV
+/// indexes a staging buffer at pa.lx_tile_pos. Covers both leaf stages and a
+/// stage wrapping a nested pipeline, whose element transfers index the same
+/// staging buffers with the stage's loop IVs.
+static mlir::scf::ForOp findPointLoop(
+    mlir::ktdf::StageOp stage, const DataTransferLegality::PipelineAnalysis& pa,
+    const scheduler::arch_view::MemoryTree& memory_tree) {
+  mlir::scf::ForOp point_loop;
+  stage->walk([&](mlir::ktdf::DataTransferOp dt) {
+    auto check = [&](mlir::Value memref_val, mlir::AffineMap map,
+                     mlir::OperandRange indices) {
+      if (point_loop || !isPerCoreScratchpad(memref_val, memory_tree)) return;
+      if (pa.lx_tile_pos >= (int64_t)map.getNumResults()) return;
+      auto dim =
+          mlir::dyn_cast<mlir::AffineDimExpr>(map.getResult(pa.lx_tile_pos));
+      if (!dim) return;
+      point_loop =
+          mlir::scf::getForInductionVarOwner(indices[dim.getPosition()]);
+    };
+    if (dt.isSourceMemRef())
+      check(dt.getSource(), dt.getSourceMapAttr().getValue(),
+            dt.getSourceIndices());
+    if (dt.isDestMemRef())
+      check(dt.getDestination(), dt.getDestMapAttr().getValue(),
+            dt.getDestIndices());
+  });
+  return point_loop;
+}
+
+/// Makes the tile behind `tile_size` hold whole aligned blocks: a
+/// ktdf.tiling.reserve_size is constrained to a multiple of alignment_factor
+/// before tile size selection runs; an already chosen constant tile size is
+/// checked instead.
+static mlir::LogicalResult constrainTileToAlignedBlocks(
+    mlir::Value tile_size, int64_t alignment_factor, mlir::Operation* anchor,
+    mlir::OpBuilder& builder) {
+  mlir::Operation* def = tile_size.getDefiningOp();
+  if (auto reserve =
+          mlir::dyn_cast_or_null<mlir::ktdf::TilingReserveSizeOp>(def)) {
+    int64_t divisibility =
+        std::lcm(reserve.getDivisibility().getSExtValue(), alignment_factor);
+    int64_t min_value =
+        std::max(reserve.getMinValue().getSExtValue(), alignment_factor);
+    reserve.setDivisibilityAttr(builder.getIndexAttr(divisibility));
+    reserve.setMinValueAttr(builder.getIndexAttr(min_value));
+    LDBG(1) << "  constrainTileToAlignedBlocks: " << reserve;
+    return mlir::success();
+  }
+  if (auto cst = mlir::dyn_cast_or_null<mlir::arith::ConstantIndexOp>(def)) {
+    if (cst.value() % alignment_factor == 0) return mlir::success();
+    return anchor->emitError(PASS_NAME ": tile size (")
+           << cst.value() << ") is not a multiple of alignment factor "
+           << alignment_factor;
+  }
+  return anchor->emitError(
+             PASS_NAME
+             ": tile size is neither a ktdf.tiling.reserve_size nor a constant "
+             "— cannot constrain it to alignment_factor=")
+         << alignment_factor;
+}
+
+/// Checks that `total_size`, a dimension's full trip count, is a constant
+/// divisible by alignment_factor. `what` names it in the error.
+static mlir::LogicalResult checkTotalDivisible(mlir::Value total_size,
+                                               int64_t alignment_factor,
+                                               mlir::Operation* anchor,
+                                               llvm::StringRef what) {
+  auto cst = mlir::dyn_cast_or_null<mlir::arith::ConstantIndexOp>(
+      total_size.getDefiningOp());
+  if (!cst) {
+    return anchor->emitError(PASS_NAME ": ")
+           << what
+           << " is not a constant — cannot verify dimension size against "
+              "alignment_factor="
+           << alignment_factor;
+  }
+  if (alignment_factor <= 0 || cst.value() % alignment_factor != 0) {
+    return anchor->emitError(PASS_NAME ": dimension total size (")
+           << cst.value() << ") is not divisible by alignment factor "
+           << alignment_factor
+           << "; tiling and alignment constraints are inconsistent";
+  }
+  return mlir::success();
+}
+
+/// Point loop of a tiled dimension: its bound `derive` is the extent of one
+/// tile, so the tile is constrained to whole aligned blocks, the per-tile trip
+/// count is divided by alignment_factor, and the loop's stride in every
+/// ktdf.tiling.linearize_index is scaled by alignment_factor so that each
+/// iteration advances one aligned block in the original iteration space.
+static mlir::LogicalResult adjustTiledLoopBound(
+    mlir::scf::ForOp loop, mlir::ktdf::TilingDeriveSizeOp derive,
+    int64_t alignment_factor, mlir::OpBuilder& builder) {
+  if (mlir::failed(checkTotalDivisible(derive.getTotalSize(), alignment_factor,
+                                       loop,
+                                       "ktdf.tiling.derive_size total_size")))
+    return mlir::failure();
+
+  // The innermost tile size is the extent this loop walks.
+  if (mlir::failed(constrainTileToAlignedBlocks(
+          derive.getTileSizes().back(), alignment_factor, loop, builder)))
+    return mlir::failure();
+
+  // Both the full tile and the epilogue remainder are multiples of
+  // alignment_factor (the tile is constrained, the total checked above), so the
+  // division is exact.
+  builder.setInsertionPoint(loop);
+  mlir::Value c_factor = mlir::arith::ConstantIndexOp::create(
+                             builder, loop.getLoc(), alignment_factor)
+                             .getResult();
+  loop.setUpperBound(
+      mlir::arith::DivUIOp::create(builder, loop.getLoc(), derive, c_factor)
+          .getResult());
+
+  mlir::Value iv = loop.getInductionVar();
+  for (mlir::Operation* user : llvm::to_vector(iv.getUsers())) {
+    auto linearize = mlir::dyn_cast<mlir::ktdf::TilingLinearizeIndexOp>(user);
+    if (!linearize) continue;
+    for (auto [idx, linearize_iv] : llvm::enumerate(linearize.getIvs())) {
+      if (linearize_iv != iv) continue;
+      builder.setInsertionPoint(linearize);
+      mlir::Value stride = linearize.getStrides()[idx];
+      mlir::Value scaled;
+      if (auto stride_cst =
+              mlir::dyn_cast_or_null<mlir::arith::ConstantIndexOp>(
+                  stride.getDefiningOp())) {
+        scaled = mlir::arith::ConstantIndexOp::create(
+                     builder, linearize.getLoc(),
+                     stride_cst.value() * alignment_factor)
+                     .getResult();
+      } else {
+        scaled = mlir::arith::MulIOp::create(builder, linearize.getLoc(),
+                                             stride, c_factor)
+                     .getResult();
+      }
+      linearize.getStridesMutable()[idx].assign(scaled);
+    }
+  }
+
+  LDBG(1) << "  adjustTiledLoopBound: per-tile trip count / alignment_factor="
+          << alignment_factor << " at " << loop.getLoc();
+  return mlir::success();
+}
+
+/// Untiled loop whose bound is the constant full trip count: it only needs
+/// total / alignment_factor iterations. Its IV indexes the global view
+/// directly, unscaled, so this is only correct when the dimension is a single
+/// aligned block (one iteration, IV 0).
+static mlir::LogicalResult adjustConstantLoopBound(mlir::scf::ForOp loop,
+                                                   int64_t alignment_factor,
+                                                   mlir::OpBuilder& builder) {
+  if (mlir::failed(checkTotalDivisible(loop.getUpperBound(), alignment_factor,
+                                       loop, "point loop upper bound")))
+    return mlir::failure();
+
+  int64_t total_val = mlir::cast<mlir::arith::ConstantIndexOp>(
+                          loop.getUpperBound().getDefiningOp())
+                          .value();
+  if (total_val != alignment_factor) {
+    return loop->emitError(PASS_NAME ": untiled dimension (")
+           << total_val << ") spans more than one aligned block of "
+           << alignment_factor << "; only tiled dimensions are supported";
+  }
+  int64_t new_ub = total_val / alignment_factor;
+  builder.setInsertionPoint(loop);
+  mlir::Value new_ub_val =
+      mlir::arith::ConstantIndexOp::create(builder, loop.getLoc(), new_ub)
+          .getResult();
+  loop.setUpperBound(new_ub_val);
+
+  LDBG(1) << "  adjustConstantLoopBound: total_size=" << total_val
+          << " / alignment_factor=" << alignment_factor
+          << " → new ub=" << new_ub << " at " << loop.getLoc();
+  return mlir::success();
+}
+
+/// Each widened transfer covers alignment_factor times as much data per
+/// iteration, so sa.innermost_loop needs alignment_factor times fewer
+/// iterations. Its upper bound is normally a ktdf.tiling.derive_size result
+/// (produced by StageCoarseningPass); when the IR was not tiled it may instead
+/// be a bare arith.constant.
 static mlir::LogicalResult adjustLoopBounds(
     const DataTransferLegality::StageAnalysis& sa,
     const DataTransferLegality::PipelineAnalysis& pa,
@@ -814,82 +1092,164 @@ static mlir::LogicalResult adjustLoopBounds(
   if (!sa.innermost_loop) return mlir::success();
 
   mlir::scf::ForOp loop = sa.innermost_loop;
-
-  // The upper bound is normally a ktdf.tiling.derive_size result (produced by
-  // StageCoarseningPass). When the IR was not tiled it may instead be a bare
-  // arith.constant.
-  int64_t total_val = -1;
-  auto derive = mlir::dyn_cast_or_null<mlir::ktdf::TilingDeriveSizeOp>(
-      loop.getUpperBound().getDefiningOp());
-  if (derive) {
-    // total_size is the constant full trip count for this dimension.
-    // tile_sizes are still symbolic reserve_size placeholders at this stage.
-    auto cst = mlir::dyn_cast_or_null<mlir::arith::ConstantIndexOp>(
-        derive.getTotalSize().getDefiningOp());
-    if (!cst) {
-      return loop->emitError(
-                 PASS_NAME
-                 ": ktdf.tiling.derive_size total_size is not a constant "
-                 "— cannot verify dimension size against alignment_factor=")
-             << pa.alignment_factor;
-    }
-    total_val = cst.value();
-  } else {
-    auto cst = mlir::dyn_cast_or_null<mlir::arith::ConstantIndexOp>(
-        loop.getUpperBound().getDefiningOp());
-    if (!cst) {
-      return loop->emitError(
-                 PASS_NAME
-                 ": innermost stage loop upper bound is neither a "
-                 "ktdf.tiling.derive_size nor a constant index "
-                 "— cannot verify dimension size against alignment_factor=")
-             << pa.alignment_factor;
-    }
-    total_val = cst.value();
-  }
-
-  if (pa.alignment_factor <= 0 || total_val % pa.alignment_factor != 0) {
-    return loop->emitError(PASS_NAME ": dimension total size (")
-           << total_val << ") is not divisible by alignment factor "
-           << pa.alignment_factor
-           << "; tiling and alignment constraints are inconsistent";
-  }
-
-  // Each widened transfer now covers alignment_factor times as much data per
-  // iteration, so the loop only needs total_val / alignment_factor iterations.
-  int64_t new_ub = total_val / pa.alignment_factor;
-  builder.setInsertionPoint(loop);
-  mlir::Value new_ub_val =
-      mlir::arith::ConstantIndexOp::create(builder, loop.getLoc(), new_ub)
-          .getResult();
-  loop.setUpperBound(new_ub_val);
-
-  LDBG(1) << "  adjustLoopBounds: total_size=" << total_val
-          << " / alignment_factor=" << pa.alignment_factor
-          << " → new ub=" << new_ub << " at " << loop.getLoc();
-  return mlir::success();
+  if (auto derive = mlir::dyn_cast_or_null<mlir::ktdf::TilingDeriveSizeOp>(
+          loop.getUpperBound().getDefiningOp()))
+    return adjustTiledLoopBound(loop, derive, pa.alignment_factor, builder);
+  return adjustConstantLoopBound(loop, pa.alignment_factor, builder);
 }
 
-/// Replaces ts.transfer with a new DataTransferOp with pa.align_dim widened
-/// Any explicit StridedLayoutAttr on a global (non-ct_local) memref operand
-/// is stripped via a memref.cast to identity layout — the strided layout was
-/// used by the analysis to detect illegality but must not appear on the
-/// rewritten transfer.
-static void rewriteTransferShape(
+/// Returns the ktdp.construct_memory_view behind a global (non-ct_local)
+/// memref operand, walking up through view-like casts; null if there is none.
+static mlir::ktdp::ConstructMemoryViewOp findConstructMemoryView(
+    mlir::Value val, const scheduler::arch_view::MemoryTree& memory_tree) {
+  if (!mlir::isa<mlir::MemRefType>(val.getType())) return {};
+  if (isPerCoreScratchpad(val, memory_tree)) return {};
+  mlir::Value cursor = val;
+  while (auto def_op = cursor.getDefiningOp()) {
+    if (auto construct =
+            mlir::dyn_cast<mlir::ktdp::ConstructMemoryViewOp>(def_op))
+      return construct;
+    if (auto cast_op = mlir::dyn_cast<mlir::memref::CastOp>(def_op))
+      cursor = cast_op.getSource();
+    else if (auto mscast_op =
+                 mlir::dyn_cast<mlir::memref::MemorySpaceCastOp>(def_op))
+      cursor = mscast_op.getSource();
+    else if (auto ricast_op =
+                 mlir::dyn_cast<mlir::memref::ReinterpretCastOp>(def_op))
+      cursor = ricast_op.getSource();
+    else
+      break;
+  }
+  return {};
+}
+
+/// Returns the order listing a view's dims in memory order: unit dims first
+/// (their index is always 0, so their position is free), then the others by
+/// decreasing stride. order[k] is the original dim placed at position k.
+static llvm::SmallVector<int64_t> memoryOrder(llvm::ArrayRef<int64_t> shape,
+                                              llvm::ArrayRef<int64_t> strides) {
+  auto order = llvm::to_vector(llvm::seq<int64_t>(0, shape.size()));
+  llvm::stable_sort(order, [&](int64_t a, int64_t b) {
+    bool a_unit = shape[a] == 1;
+    bool b_unit = shape[b] == 1;
+    if (a_unit != b_unit) return a_unit;
+    if (a_unit) return false;
+    return strides[a] > strides[b];
+  });
+  return order;
+}
+
+/// Rewrites `construct` to list its dims in memory order (see memoryOrder),
+/// and returns that order. Reordering a view's dims, each keeping its own size
+/// and stride, only renames which index slot addresses which buffer dim: the
+/// view covers the same elements at the same addresses. Memory order is the
+/// one reordering that both puts the contiguous dim p innermost (the hardware
+/// moves contiguous sticks) and makes the strides decrease (downstream layout
+/// analysis reads views as row-major).
+///
+/// The sizes, strides, coordinate_set and result type are reordered together,
+/// and the new type is propagated through the view-like casts that consume
+/// the view. Any other consumer except ktdf.data_transfer (whose maps the
+/// caller reorders) is an error.
+static mlir::FailureOr<llvm::SmallVector<int64_t>> permuteViewToMemoryOrder(
+    mlir::ktdp::ConstructMemoryViewOp construct, mlir::Operation* anchor) {
+  mlir::MLIRContext* ctx = construct->getContext();
+  auto orig_mrt = mlir::cast<mlir::MemRefType>(construct.getResult().getType());
+  llvm::ArrayRef<int64_t> shape = construct.getStaticSizes();
+  llvm::ArrayRef<int64_t> strides = construct.getStaticStrides();
+  int64_t rank = (int64_t)shape.size();
+  if (llvm::any_of(shape, mlir::ShapedType::isDynamic) ||
+      llvm::any_of(strides, mlir::ShapedType::isDynamic))
+    return anchor->emitError(PASS_NAME
+                             ": strided view must have static sizes and "
+                             "strides to be reordered");
+
+  llvm::SmallVector<int64_t> order = memoryOrder(shape, strides);
+  llvm::SmallVector<int64_t> new_shape, new_strides;
+  for (int64_t dim : order) {
+    new_shape.push_back(shape[dim]);
+    new_strides.push_back(strides[dim]);
+  }
+  // A unit dim's stride never contributes to an address; raise it where needed
+  // so the strides never increase going inwards.
+  for (int64_t k = rank - 2; k >= 0; --k)
+    if (new_shape[k] == 1)
+      new_strides[k] = std::max(new_strides[k], new_strides[k + 1]);
+
+  // Old dim `order[k]` is now dim k.
+  mlir::IntegerSet set = construct.getCoordinateSet().getValue();
+  llvm::SmallVector<mlir::AffineExpr> dim_replacements(rank);
+  for (int64_t k = 0; k < rank; ++k)
+    dim_replacements[order[k]] = mlir::getAffineDimExpr(k, ctx);
+  llvm::SmallVector<mlir::AffineExpr> constraints;
+  for (mlir::AffineExpr expr : set.getConstraints())
+    constraints.push_back(expr.replaceDims(dim_replacements));
+  mlir::IntegerSet new_set = mlir::IntegerSet::get(
+      rank, set.getNumSymbols(), constraints, set.getEqFlags());
+
+  LDBG(1) << "  permuteViewToMemoryOrder: " << construct->getLoc();
+  construct.setStaticSizesAttr(mlir::DenseI64ArrayAttr::get(ctx, new_shape));
+  construct.setStaticStridesAttr(
+      mlir::DenseI64ArrayAttr::get(ctx, new_strides));
+  construct.setCoordinateSetAttr(mlir::IntegerSetAttr::get(new_set));
+  auto new_layout = mlir::StridedLayoutAttr::get(
+      ctx, /*offset=*/mlir::ShapedType::kDynamic, new_strides);
+  construct.getResult().setType(
+      mlir::MemRefType::get(new_shape, orig_mrt.getElementType(), new_layout,
+                            orig_mrt.getMemorySpace()));
+
+  // Propagate the new shape and layout through the view-like casts.
+  llvm::SmallVector<mlir::Value> worklist = {construct.getResult()};
+  while (!worklist.empty()) {
+    mlir::Value v = worklist.pop_back_val();
+    auto src_type = mlir::cast<mlir::MemRefType>(v.getType());
+    for (mlir::Operation* user : v.getUsers()) {
+      if (mlir::isa<mlir::ktdf::DataTransferOp>(user)) continue;
+      if (!mlir::isa<mlir::memref::CastOp, mlir::memref::MemorySpaceCastOp>(
+              user))
+        return user->emitError(PASS_NAME
+                               ": cannot reorder a strided view consumed by "
+                               "this op");
+      mlir::Value result = user->getResult(0);
+      auto res_type = mlir::cast<mlir::MemRefType>(result.getType());
+      result.setType(mlir::MemRefType::get(
+          src_type.getShape(), res_type.getElementType(), src_type.getLayout(),
+          res_type.getMemorySpace()));
+      worklist.push_back(result);
+    }
+  }
+  return order;
+}
+
+/// Replaces ts.transfer with a new DataTransferOp widened along view dim p by
+/// pa.alignment_factor.
+///
+/// A side on the strided global view is rewritten through the view's memory
+/// order: the view is reordered once (recorded in `view_orders`), the
+/// transfer's index map results and sizes are reordered with it, and the size
+/// of p, now the innermost dim, is widened. Every other memref side (staging
+/// buffers, row-major views) is widened at p in place.
+///
+/// The staging block needs no reordering: in a block only p and q span more
+/// than one element, and memory order puts q before p, so the block lands in
+/// the staging buffer with p and q exchanged — which the element-level
+/// transpose undoes.
+static mlir::LogicalResult rewriteTransferShape(
     const DataTransferLegality::TransferStep& ts,
     const DataTransferLegality::PipelineAnalysis& pa,
     const scheduler::arch_view::MemoryTree& memory_tree,
+    llvm::DenseMap<mlir::Operation*, llvm::SmallVector<int64_t>>& view_orders,
     mlir::OpBuilder& builder) {
   mlir::ktdf::DataTransferOp op = ts.transfer;
   mlir::MLIRContext* ctx = op->getContext();
 
-  // Convert offset-from-end to absolute indices for src and dst size vectors.
   auto new_src_sizes = op.getMixedSourceSizes();
   auto new_dst_sizes = op.getMixedDestSizes();
-  int64_t src_rank = (int64_t)new_src_sizes.size();
-  int64_t dst_rank = (int64_t)new_dst_sizes.size();
-  int64_t src_dim = src_rank - 1 - pa.align_dim;
-  int64_t dst_dim = dst_rank - 1 - pa.align_dim;
+  mlir::AffineMap src_map = op.isSourceMemRef()
+                                ? op.getSourceMapAttr().getValue()
+                                : mlir::AffineMap{};
+  mlir::AffineMap dst_map =
+      op.isDestMemRef() ? op.getDestMapAttr().getValue() : mlir::AffineMap{};
 
   auto get_scaled = [&](mlir::OpFoldResult ofr) -> mlir::OpFoldResult {
     int64_t existing =
@@ -899,113 +1259,53 @@ static void rewriteTransferShape(
                                   existing * pa.alignment_factor);
   };
 
-  if (src_dim >= 0 && src_dim < src_rank)
-    new_src_sizes[src_dim] = get_scaled(new_src_sizes[src_dim]);
-  if (dst_dim >= 0 && dst_dim < dst_rank)
-    new_dst_sizes[dst_dim] = get_scaled(new_dst_sizes[dst_dim]);
+  auto rewrite_side = [&](mlir::Value val,
+                          llvm::SmallVector<mlir::OpFoldResult>& sizes,
+                          mlir::AffineMap& map) -> mlir::LogicalResult {
+    if (!mlir::isa<mlir::MemRefType>(val.getType())) return mlir::success();
+    int64_t rank = (int64_t)sizes.size();
 
-  mlir::AffineMap src_map = op.isSourceMemRef()
-                                ? op.getSourceMapAttr().getValue()
-                                : mlir::AffineMap{};
-  mlir::AffineMap dst_map =
-      op.isDestMemRef() ? op.getDestMapAttr().getValue() : mlir::AffineMap{};
-
-  // Fix non-row-major strides on any global memref operand by
-  // walking back to the ktdp.construct_memory_view and rewriting its
-  // static_strides attribute to natural row-major values in place. The
-  // strided layout was used during analysis to detect illegality;
-  auto fix_construct_strides = [&](mlir::Value val) {
-    auto mrt = mlir::dyn_cast<mlir::MemRefType>(val.getType());
-    if (!mrt) return;
-    if (isPerCoreScratchpad(val, memory_tree)) return;
-    if (!mlir::isa<mlir::StridedLayoutAttr>(mrt.getLayout())) return;
-
-    // Walk up view-like ops to find the construct_memory_view.
-    mlir::Value cursor = val;
-    mlir::ktdp::ConstructMemoryViewOp construct;
-    while (auto defOp = cursor.getDefiningOp()) {
-      if (auto c = mlir::dyn_cast<mlir::ktdp::ConstructMemoryViewOp>(defOp)) {
-        construct = c;
-        break;
+    // The strided view is the one whose own innermost stride is not 1, or
+    // that an earlier transfer already reordered.
+    auto construct = findConstructMemoryView(val, memory_tree);
+    const llvm::SmallVector<int64_t>* order = nullptr;
+    if (construct) {
+      auto it = view_orders.find(construct.getOperation());
+      if (it == view_orders.end() && construct.getStaticStrides().back() != 1) {
+        auto new_order = permuteViewToMemoryOrder(construct, op);
+        if (mlir::failed(new_order)) return mlir::failure();
+        it =
+            view_orders.try_emplace(construct.getOperation(), *new_order).first;
       }
-      if (auto castOp = mlir::dyn_cast<mlir::memref::CastOp>(defOp))
-        cursor = castOp.getSource();
-      else if (auto mscastOp =
-                   mlir::dyn_cast<mlir::memref::MemorySpaceCastOp>(defOp))
-        cursor = mscastOp.getSource();
-      else if (auto ricastOp =
-                   mlir::dyn_cast<mlir::memref::ReinterpretCastOp>(defOp))
-        cursor = ricastOp.getSource();
-      else
-        break;
+      if (it != view_orders.end()) order = &it->second;
     }
-    if (!construct) return;
 
-    // Compute row-major strides from the construct op's result shape.
-    auto orig_mrt =
-        mlir::cast<mlir::MemRefType>(construct.getResult().getType());
-    auto shape = orig_mrt.getShape();
-    int64_t rank = (int64_t)shape.size();
-    llvm::SmallVector<int64_t> row_major(rank, 1);
-    for (int64_t i = rank - 2; i >= 0; --i)
-      row_major[i] = row_major[i + 1] * shape[i + 1];
-
-    LDBG(1) << "  fix_construct_strides: rewriting strides on "
-            << construct->getLoc() << " to row-major";
-    construct.setStaticStridesAttr(
-        mlir::DenseI64ArrayAttr::get(ctx, row_major));
-
-    // Update the construct op's result type to carry the new row-major layout,
-    // then propagate the updated type forward through all downstream view-like
-    // ops (memory_space_cast, cast, reinterpret_cast) so the strided layout
-    // doesn't linger in their result types.
-    auto new_layout = mlir::StridedLayoutAttr::get(
-        ctx, /*offset=*/mlir::ShapedType::kDynamic, row_major);
-    auto new_construct_type =
-        mlir::MemRefType::get(shape, orig_mrt.getElementType(), new_layout,
-                              orig_mrt.getMemorySpace());
-    construct.getResult().setType(new_construct_type);
-
-    // Walk forward through uses, updating each view-like op's result type.
-    llvm::SmallVector<mlir::Value> worklist = {construct.getResult()};
-    while (!worklist.empty()) {
-      mlir::Value v = worklist.pop_back_val();
-      for (mlir::Operation* user : v.getUsers()) {
-        mlir::Value new_val;
-        mlir::MemRefType src_type =
-            mlir::dyn_cast<mlir::MemRefType>(v.getType());
-        if (!src_type) continue;
-
-        if (auto castOp = mlir::dyn_cast<mlir::memref::CastOp>(user)) {
-          // Propagate the new layout into the cast result type.
-          auto res_type =
-              mlir::dyn_cast<mlir::MemRefType>(castOp.getResult().getType());
-          if (!res_type) continue;
-          auto updated = mlir::MemRefType::get(
-              res_type.getShape(), res_type.getElementType(),
-              src_type.getLayout(), res_type.getMemorySpace());
-          castOp.getResult().setType(updated);
-          new_val = castOp.getResult();
-        } else if (auto mscastOp =
-                       mlir::dyn_cast<mlir::memref::MemorySpaceCastOp>(user)) {
-          auto res_type =
-              mlir::dyn_cast<mlir::MemRefType>(mscastOp.getResult().getType());
-          if (!res_type) continue;
-          auto updated = mlir::MemRefType::get(
-              res_type.getShape(), res_type.getElementType(),
-              src_type.getLayout(), res_type.getMemorySpace());
-          mscastOp.getResult().setType(updated);
-          new_val = mscastOp.getResult();
-        } else {
-          continue;
-        }
-        worklist.push_back(new_val);
-      }
+    if (!order) {
+      // View dims are the trailing dims of every memref side.
+      int64_t pos_p = rank - pa.view_rank + pa.perm_p;
+      sizes[pos_p] = get_scaled(sizes[pos_p]);
+      return mlir::success();
     }
+    if (rank != (int64_t)order->size() || (*order)[rank - 1] != pa.perm_p)
+      return op->emitError(PASS_NAME
+                           ": memory order of the strided view does not end "
+                           "with its contiguous dim");
+    llvm::SmallVector<mlir::OpFoldResult> new_sizes;
+    llvm::SmallVector<mlir::AffineExpr> results;
+    for (int64_t dim : *order) {
+      new_sizes.push_back(sizes[dim]);
+      results.push_back(map.getResult(dim));
+    }
+    sizes = new_sizes;
+    map = mlir::AffineMap::get(map.getNumDims(), map.getNumSymbols(), results,
+                               ctx);
+    sizes[rank - 1] = get_scaled(sizes[rank - 1]);
+    return mlir::success();
   };
 
-  fix_construct_strides(op.getSource());
-  fix_construct_strides(op.getDestination());
+  if (mlir::failed(rewrite_side(op.getSource(), new_src_sizes, src_map)) ||
+      mlir::failed(rewrite_side(op.getDestination(), new_dst_sizes, dst_map)))
+    return mlir::failure();
 
   builder.setInsertionPoint(op);
   auto new_op = mlir::ktdf::DataTransferOp::create(
@@ -1016,9 +1316,10 @@ static void rewriteTransferShape(
   for (mlir::NamedAttribute attr : op->getDiscardableAttrs())
     new_op->setDiscardableAttr(attr.getName(), attr.getValue());
 
-  LDBG(1) << "  rewriteTransferShape: scaled dim " << pa.align_dim
+  LDBG(1) << "  rewriteTransferShape: widened dim " << pa.perm_p
           << " by factor " << pa.alignment_factor << ": " << new_op;
   op.erase();
+  return mlir::success();
 }
 
 /// Replaces ts.transfer with a new DataTransferOp whose memref side is sized
@@ -1078,10 +1379,13 @@ static void rewriteTransferShrink(
     LDBG(1) << "  rewriteTransferShrink: row_iv=" << (bool)row_iv
             << " col_iv=" << (bool)col_iv << " — apply_row_col will no-op";
 
-  // For ct_local memref operands, build a fresh affine map and index list.
-  // The load (source) buffer is row-major: index [0, 0, %row, %col].
-  // The store (destination) buffer is transposed (column-major): index
-  // [0, 0, %col, %row] — row and col are swapped to match the word layout.
+  // For ct_local memref operands, offset the staging buffer's p and q dims by
+  // the element IVs. The other dims keep the transfer's own indices: they
+  // select which aligned block of the staging buffer this element belongs to.
+  // The load (source) buffer holds the block with p and q exchanged (the view
+  // was read through the transposition): index [p: %row, q: %col].
+  // The store (destination) buffer holds it in view order: index
+  // [p: %col, q: %row] — the exchange of p and q is undone here.
   auto apply_row_col = [&](mlir::Value memref_val, mlir::AffineMap& map,
                            llvm::SmallVector<mlir::Value>& indices,
                            bool transpose) {
@@ -1089,21 +1393,25 @@ static void rewriteTransferShrink(
     if (!isPerCoreScratchpad(memref_val, memory_tree)) return;
     auto mrt = mlir::cast<mlir::MemRefType>(memref_val.getType());
 
+    // View dims are the trailing dims of the staging buffer.
     int64_t rank = (int64_t)mrt.getRank();
-    if (rank < 2) return;
+    int64_t pos_p = rank - pa.view_rank + pa.perm_p;
+    int64_t pos_q = rank - pa.view_rank + pa.perm_q;
+    if (pos_p < 0 || pos_q >= rank) return;
 
-    // d0 = first IV, d1 = second IV.
-    // For load: (row, col) -> [0,0,row,col].
-    // For store (transposed): (col, row) -> [0,0,col,row] i.e. swap the IVs.
+    // The element IVs become two new dims after the map's existing ones.
+    // For load: (row, col) at (p, q).
+    // For store (transposed): (col, row) at (p, q) i.e. swap the IVs.
     mlir::Value first_iv = transpose ? col_iv : row_iv;
     mlir::Value second_iv = transpose ? row_iv : col_iv;
 
-    llvm::SmallVector<mlir::AffineExpr> results(
-        rank, mlir::getAffineConstantExpr(0, ctx));
-    results[rank - 2] = mlir::getAffineDimExpr(0, ctx);
-    results[rank - 1] = mlir::getAffineDimExpr(1, ctx);
-    map = mlir::AffineMap::get(/*dims=*/2, /*syms=*/0, results, ctx);
-    indices = {first_iv, second_iv};
+    unsigned num_dims = map.getNumDims();
+    llvm::SmallVector<mlir::AffineExpr> results(map.getResults());
+    results[pos_p] = results[pos_p] + mlir::getAffineDimExpr(num_dims, ctx);
+    results[pos_q] = results[pos_q] + mlir::getAffineDimExpr(num_dims + 1, ctx);
+    map = mlir::AffineMap::get(num_dims + 2, map.getNumSymbols(), results, ctx);
+    // Map operands are the dims followed by the symbols.
+    indices.insert(indices.begin() + num_dims, {first_iv, second_iv});
   };
 
   auto new_src_indices = llvm::SmallVector<mlir::Value>(op.getSourceIndices());
@@ -1179,12 +1487,26 @@ static mlir::LogicalResult fixPipeline(
     DataTransferLegality& legality, DataTransferLegality::PipelineAnalysis& pa,
     const mlir::ktdf_arch::ResourceKinds& resource_kinds,
     const scheduler::arch_view::MemoryTree& memory_tree,
+    llvm::DenseMap<mlir::Operation*, llvm::SmallVector<int64_t>>& view_orders,
     mlir::OpBuilder& builder) {
   LDBG(1) << "  fixPipeline: pipeline at " << pa.pipeline.getLoc()
           << " alignment_factor=" << pa.alignment_factor
           << " stride_elems=" << pa.stride_elems;
+  if (pa.has_error) return mlir::failure();
+  if (pa.alignment_factor == 0) return mlir::success();  // nothing to fix
 
   for (DataTransferLegality::StageAnalysis& sa : pa.stages) {
+    // In the widening pipeline every stage walks p with one loop: the one
+    // indexing the staging buffers at p's tile dim. That loop, not the
+    // stage's innermost one, is the one whose trip count shrinks.
+    if (pa.alignment_kind == DataTransferLegality::AlignmentKind::Widen) {
+      sa.innermost_loop = findPointLoop(sa.stage, pa, memory_tree);
+      if (!sa.innermost_loop)
+        return sa.stage->emitError(PASS_NAME
+                                   ": no loop in this stage indexes the "
+                                   "staging buffer along the contiguous dim");
+    }
+
     if (sa.nested_pipeline != nullptr) {
       // Collapse the tile loop enclosing the nested pipeline to ub=1 so the
       // only column iteration is the element loop inserted below.
@@ -1198,12 +1520,22 @@ static mlir::LogicalResult fixPipeline(
       llvm::SmallVector<int64_t, 1> inherited_strides = {pa.stride_elems};
       *sa.nested_pipeline = legality.analyzePipeline(
           sa.nested_pipeline->pipeline, resource_kinds, inherited_strides);
+      // The element transfers address the same staging buffers, so they need
+      // the outer pipeline's p/q geometry.
+      sa.nested_pipeline->perm_p = pa.perm_p;
+      sa.nested_pipeline->perm_q = pa.perm_q;
+      sa.nested_pipeline->view_rank = pa.view_rank;
+      sa.nested_pipeline->block_elems = pa.block_elems;
+      sa.nested_pipeline->lx_tile_pos = pa.lx_tile_pos;
       LDBG(1) << "  nested PipelineAnalysis:\n" << *sa.nested_pipeline;
 
-      insertLoopAroundPipeline(sa.nested_pipeline.get(), pa.stride_elems,
+      // One element loop per block dim: p and q both span block_elems (the
+      // analysis requires n_p == n_q).
+      insertLoopAroundPipeline(sa.nested_pipeline.get(), pa.block_elems,
                                builder);
       if (mlir::failed(fixPipeline(legality, *sa.nested_pipeline,
-                                   resource_kinds, memory_tree, builder)))
+                                   resource_kinds, memory_tree, view_orders,
+                                   builder)))
         return mlir::failure();
       continue;
     }
@@ -1217,7 +1549,9 @@ static mlir::LogicalResult fixPipeline(
         // Outer pipeline: widen staging allocs and bulk transfer shapes
         if (ts.is_illegal || ts.is_displaced) {
           widenAlloc(ts, pa, memory_tree, builder);
-          rewriteTransferShape(ts, pa, memory_tree, builder);
+          if (mlir::failed(rewriteTransferShape(ts, pa, memory_tree,
+                                                view_orders, builder)))
+            return mlir::failure();
         }
       } else {
         // Nested / inner pipeline: shrink transfers to scalar access with IV
@@ -1263,12 +1597,19 @@ struct DataTransferAlignmentPass
         });
 
     mlir::OpBuilder builder(getOperation()->getContext());
+    // Strided views already reordered into memory order, with their order; a
+    // view shared by several transfers must be reordered only once.
+    llvm::DenseMap<mlir::Operation*, llvm::SmallVector<int64_t>> view_orders;
     for (auto& pa : pipelines) {
       LDBG(1) << pa;
+      if (pa.has_error) {
+        signalPassFailure();
+        return;
+      }
       if (pa.alignment_factor == 0)
         continue;  // nothing to fix for this pipeline
       if (mlir::failed(fixPipeline(legality_, pa, resource_kinds, memory_tree,
-                                   builder))) {
+                                   view_orders, builder))) {
         signalPassFailure();
         return;
       }

@@ -85,31 +85,6 @@ mlir::Value insertSplatShuffle(mlir::PatternRewriter& rewriter,
       .getOutput();
 }
 
-/// Create a vectorchain.shuffle that takes the leading `num_elements` lanes of
-/// src_vec, giving vector<num_elements x T> with indices [0..num_elements-1]
-/// and repetition 1.
-mlir::Value insertLeadingLanesShuffle(mlir::PatternRewriter& rewriter,
-                                      mlir::Location loc, mlir::Value src_vec,
-                                      int64_t num_elements) {
-  auto src_vec_type = mlir::cast<mlir::VectorType>(src_vec.getType());
-  auto elem_type = src_vec_type.getElementType();
-
-  llvm::SmallVector<mlir::Attribute> index_attrs;
-  for (int64_t i = 0; i < num_elements; ++i) {
-    index_attrs.push_back(rewriter.getIntegerAttr(rewriter.getI32Type(), i));
-  }
-  auto indices_attr = rewriter.getArrayAttr(index_attrs);
-
-  auto result_type = mlir::VectorType::get({num_elements}, elem_type);
-
-  return mlir::vectorchain::ShuffleOp::create(
-             rewriter, loc, result_type, src_vec,
-             /*variable=*/mlir::ValueRange{}, /*pad=*/mlir::ValueRange{},
-             /*mask=*/nullptr,
-             /*dbgName=*/nullptr, indices_attr, rewriter.getI32IntegerAttr(1))
-      .getOutput();
-}
-
 /// One time dimension of one side of a transfer: which memref dimension it
 /// advances, and by how many indices of that dimension per step.
 struct TransferTimeStep {
@@ -701,9 +676,9 @@ struct LowerDataTransferPattern
     // For splat/pad transfers the source is smaller than the destination —
     // the hardware replicates or zero-pads to fill the vector. Skip the
     // equality check and use the destination size as the transfer width.
-    // For lane0 transfers the destination is one element: the full FIFO slot
-    // is received and only its lane 0 is stored, so the source size is the
-    // transfer width.
+    // For lane0 transfers the destination is one element: the sender fills the
+    // full FIFO slot and only its lane 0 is received and stored, so the source
+    // size is the transfer width.
     auto transfer_mode_attr = llvm::dyn_cast_if_present<mlir::StringAttr>(
         data_transfer_op->getDiscardableAttr("transfer_mode"));
     llvm::StringRef transfer_mode =
@@ -1068,8 +1043,8 @@ struct LowerDataTransferPattern
     return mlir::success();
   }
 
-  /// Lower as receive and vector_store (FIFO to L1). When is_lane0, the
-  /// received vector is narrowed to its lane 0, which is stored at the
+  /// Lower as receive and vector_store (FIFO to L1). When is_lane0, only the
+  /// leading dst_total_elements lanes are received, and they are stored at the
   /// destination indices.
   mlir::LogicalResult lowerAsReceiveAndStore(
       mlir::PatternRewriter& rewriter,
@@ -1103,21 +1078,20 @@ struct LowerDataTransferPattern
     }
     mlir::Value src_unit = *src_unit_result;
 
-    // Create dataflow.receive operation
+    // Create dataflow.receive operation. For lane0 the receive is only as wide
+    // as the destination: the narrow receive type is what selects the masked
+    // store of the leading lanes.
+    mlir::VectorType receive_type =
+        is_lane0 ? mlir::VectorType::get({dst_total_elements},
+                                         vector_type.getElementType())
+                 : vector_type;
     auto receive_op = mlir::dataflow::ReceiveOp::create(
-        rewriter, data_transfer_op.getLoc(), vector_type, src_unit,
+        rewriter, data_transfer_op.getLoc(), receive_type, src_unit,
         /*dbgName=*/nullptr);
-
-    // For lane0: keep only lane 0.
-    mlir::Value store_value = receive_op.getData();
-    if (is_lane0) {
-      store_value = insertLeadingLanesShuffle(
-          rewriter, data_transfer_op.getLoc(), store_value, dst_total_elements);
-    }
 
     // Create vector_store operation
     mlir::agen::VectorStoreOp::create(
-        rewriter, data_transfer_op.getLoc(), store_value, dst_memref,
+        rewriter, data_transfer_op.getLoc(), receive_op.getData(), dst_memref,
         /*dbgName=*/nullptr, dst_map, dst_indices, store_set, store_order);
 
     // Erase the original data_transfer operation
