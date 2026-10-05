@@ -23,11 +23,12 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <algorithm>
 #include <optional>
 
+#include "dataflow-scheduler/Dialect/KTDF/Analysis/TileSizeConstraints.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/Passes.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/raw_ostream.h"
@@ -61,106 +62,29 @@ namespace {
 // TODO: should use much large size when proper L1 usage analysis is available.
 constexpr int64_t kMaxCandidateTileSize = 2;
 
-struct AssociatedLoopInfo {
-  scf::ForOp loop;
-
-  // The total size being tiled (numerator in ceildiv operation).
-  // For pattern: %bound = arith.ceildivui %total_size, %tile_size
-  // This represents %total_size which must be evenly divisible by the tile
-  // size.
-  int64_t total_size;
-};
-
-struct TileSizeInfo {
-  ktdf::TilingReserveSizeOp reserve_size_op;
-  SmallVector<AssociatedLoopInfo> associated_loops;
-};
-
 void logUnresolved(ktdf::TilingReserveSizeOp reserve_size_op,
                    llvm::StringRef reason) {
   LDBG(1) << "unresolved tiling.reserve_size at " << reserve_size_op.getLoc()
           << ": " << reason;
 }
 
-void collectAssociatedLoops(
-    Value value, TileSizeInfo& ts_info, llvm::DenseSet<Value>& visited_values,
-    SmallVectorImpl<ktdf::TilingReserveSizeOp>& unresolved_ops) {
-  if (!visited_values.insert(value).second) return;
-
-  for (Operation* user : value.getUsers()) {
-    // Pattern: %bound = arith.ceildivui %total_size, %tile_size
-    // Then: scf.for %i = %c0 to %bound step %c1
-    if (auto ceildiv_op = dyn_cast<arith::CeilDivUIOp>(user)) {
-      // Check if tile_size is the divisor (RHS)
-      if (ceildiv_op.getRhs() != value) {
-        logUnresolved(ts_info.reserve_size_op,
-                      "tile size used as dividend (LHS) in ceildivui, expected "
-                      "divisor (RHS)");
-        unresolved_ops.push_back(ts_info.reserve_size_op);
-        continue;
-      }
-
-      // Get the total size (LHS of ceildiv)
-      auto total_size_opt = getConstantIntValue(ceildiv_op.getLhs());
-      if (!total_size_opt.has_value()) {
-        logUnresolved(ts_info.reserve_size_op,
-                      "non-constant total size in arith.ceildivui");
-        unresolved_ops.push_back(ts_info.reserve_size_op);
-        continue;
-      }
-
-      // Now trace the ceildiv result to find loops that use it as upper bound
-      Value ceildiv_result = ceildiv_op.getResult();
-      for (Operation* bound_user : ceildiv_result.getUsers()) {
-        if (auto for_op = dyn_cast<scf::ForOp>(bound_user)) {
-          if (for_op.getUpperBound() == ceildiv_result) {
-            ts_info.associated_loops.push_back(
-                AssociatedLoopInfo{for_op, *total_size_opt});
-          }
-        }
-      }
-      continue;
-    }
-
-    // TODO: in future consider memref.alloc sizes to constrain the tile size
-    // selection
-  }
-}
-
-enum class TileSizeValidity {
-  // Candidate tile size is valid for all loops
-  kValidForAllLoops,
-  // Invalid for this candidate tile size.
-  kInvalidForThisTileSize,
-};
-
-TileSizeValidity evaluateCandidateTileSize(const TileSizeInfo& ts_info,
-                                           int64_t candidate) {
-  for (const AssociatedLoopInfo& loop_info : ts_info.associated_loops) {
-    // Check if the total size is evenly divisible by the candidate tile size
-    if (loop_info.total_size % candidate != 0) {
-      return TileSizeValidity::kInvalidForThisTileSize;
-    }
-  }
-
-  return TileSizeValidity::kValidForAllLoops;
-}
-
+/// Chooses a tile size among those its constraints allow: the largest legal
+/// one up to max(kMaxCandidateTileSize, min_value), else the smallest legal one
+/// above that. Returns std::nullopt if the tile size tiles no loop (nothing to
+/// choose against) or if no tile size is legal.
 std::optional<int64_t> chooseTileSize(
-    TileSizeInfo& ts_info,
-    SmallVectorImpl<ktdf::TilingReserveSizeOp>& unresolved_ops) {
-  const int64_t min_value =
-      ts_info.reserve_size_op.getMinValue().getSExtValue();
-  const int64_t divisibility =
-      ts_info.reserve_size_op.getDivisibility().getSExtValue();
+    const ktdf::TileSizeConstraints& constraints) {
+  ktdf::TilingReserveSizeOp reserve_size_op = constraints.getReserveSizeOp();
+  for (llvm::StringRef reason : constraints.getUnrecognizedUses())
+    logUnresolved(reserve_size_op, reason);
 
-  if (ts_info.associated_loops.empty()) {
-    logUnresolved(ts_info.reserve_size_op,
+  if (!constraints.hasTiledLoops()) {
+    logUnresolved(reserve_size_op,
                   "no associated loops found via ceildivui pattern");
-    unresolved_ops.push_back(ts_info.reserve_size_op);
     return std::nullopt;
   }
 
+  const int64_t min_value = std::max<int64_t>(1, constraints.getMinValue());
   const int64_t start_candidate =
       std::max<int64_t>(kMaxCandidateTileSize, min_value);
   for (int64_t candidate = start_candidate; candidate >= min_value;
@@ -170,15 +94,15 @@ std::optional<int64_t> chooseTileSize(
         llvm::dbgs() << "[" PASS_NAME
                      << "] no suitable tile size greater than one for "
                         "tiling.reserve_size at "
-                     << ts_info.reserve_size_op.getLoc() << ".\n";
+                     << reserve_size_op.getLoc() << ".\n";
       }
     });
-    if (divisibility > 1 && candidate % divisibility != 0) continue;
-    TileSizeValidity eval = evaluateCandidateTileSize(ts_info, candidate);
-    if (eval == TileSizeValidity::kValidForAllLoops) return candidate;
+    if (constraints.isLegal(candidate)) return candidate;
   }
-  // At the very least a tile size of 1 should have been chosen.
-  llvm_unreachable("unresolved tile size");
+  // The constraints exclude every candidate up to start_candidate (e.g. a
+  // divisibility above it); take the smallest legal one above.
+  for (int64_t candidate : constraints.legalTileSizes())
+    if (candidate > start_candidate) return candidate;
   return std::nullopt;
 }
 
@@ -208,37 +132,38 @@ struct TileSizeSelectionPass
       return signalPassFailure();
     }
 
-    SmallVector<TileSizeInfo> analyses;
+    SmallVector<ktdf::TileSizeConstraints> analyses;
     analyses.reserve(reserve_size_ops.size());
-
-    SmallVector<ktdf::TilingReserveSizeOp> unresolved_ops;
-    for (ktdf::TilingReserveSizeOp reserve_size_op : reserve_size_ops) {
-      TileSizeInfo ts_info;
-      ts_info.reserve_size_op = reserve_size_op;
-      llvm::DenseSet<Value> visited_values;
-      collectAssociatedLoops(reserve_size_op.getResult(), ts_info,
-                             visited_values, unresolved_ops);
-      analyses.push_back(std::move(ts_info));
-    }
+    for (ktdf::TilingReserveSizeOp reserve_size_op : reserve_size_ops)
+      analyses.emplace_back(reserve_size_op);
 
     OpBuilder builder(module.getContext());
-    for (auto [idx, ts_info] : llvm::enumerate(analyses)) {
+    for (auto [idx, constraints] : llvm::enumerate(analyses)) {
+      ktdf::TilingReserveSizeOp reserve_size_op =
+          constraints.getReserveSizeOp();
       std::optional<int64_t> chosen_tile_size;
       if (!effective_tile_sizes.empty()) {
         chosen_tile_size = effective_tile_sizes[idx];
       } else {
-        chosen_tile_size = chooseTileSize(ts_info, unresolved_ops);
+        chosen_tile_size = chooseTileSize(constraints);
+        if (!chosen_tile_size.has_value() && constraints.hasTiledLoops()) {
+          reserve_size_op.emitError()
+              << "[" PASS_NAME "] no tile size satisfies min_value = "
+              << constraints.getMinValue()
+              << ", divisibility = " << constraints.getDivisibility()
+              << " and the totals of the loops it tiles";
+          return signalPassFailure();
+        }
       }
       if (!chosen_tile_size.has_value()) {
         continue;
       }
 
-      builder.setInsertionPoint(ts_info.reserve_size_op);
+      builder.setInsertionPoint(reserve_size_op);
       auto constant_op = arith::ConstantIndexOp::create(
-          builder, ts_info.reserve_size_op.getLoc(), *chosen_tile_size);
-      ts_info.reserve_size_op.getResult().replaceAllUsesWith(
-          constant_op.getResult());
-      ts_info.reserve_size_op.erase();
+          builder, reserve_size_op.getLoc(), *chosen_tile_size);
+      reserve_size_op.getResult().replaceAllUsesWith(constant_op.getResult());
+      reserve_size_op.erase();
     }
 
     // TODO: Replace this placeholder heuristic with a real cost model that
@@ -246,7 +171,6 @@ struct TileSizeSelectionPass
     // liveness analysis should determine which L1 buffers are live at each
     // point so we can compute peak live scratchpad usage and choose tile sizes
     // that fully utilize L1 capacity without exceeding the hardware limit.
-    (void)unresolved_ops;
   }
 };
 

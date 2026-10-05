@@ -6,6 +6,7 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFAnalysis
     ReductionChunkAnalysis.cpp
     Reuse.cpp
     StageGrouping.cpp
+    TileSizeConstraints.cpp
     Utils.cpp
   
   ADDITIONAL_HEADER_DIRS
