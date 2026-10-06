@@ -2,40 +2,36 @@
 
 // CHECK-LABEL: func.func @local_schedule_0()
 
-// Staging allocs reshaped to memref<?x?x1x64x64xf16, "L1">:
-// CHECK:      %[[PRIV:.*]]:4 = ktdf.private -> (memref<?x?x1x64x64xf16, "L1">, memref<?x?x1x64x64xf16, "L1">, !ktdf.token, !ktdf.token) {
-// CHECK-DAG:    %[[A0:.*]] = memref.alloc(%{{.*}}, %{{.*}}) : memref<?x?x1x64x64xf16, "L1">
-// CHECK-DAG:    %[[A1:.*]] = memref.alloc(%{{.*}}, %{{.*}}) : memref<?x?x1x64x64xf16, "L1">
-// CHECK:        ktdf.private_yield %[[A0]], %[[A1]]
+// PURPOSE: the tiled re-stick (12 tiles of 64x64; tile sizes are still
+// reserve_size placeholders) is rebuilt as one broadcast load and one
+// one-element store per element, and every endpoint keeps the tile indices.
+// Catches PR #168's rewrite, which addressed element [0, 0, 0, row, col] of
+// every tile (on the device only the first tile of each staging buffer was
+// re-stuck) and stored each element with a FIFO-wide transfer. Also pins the
+// row tile to the whole 64-row dimension the widened transfers cover; the
+// batch tile stays free.
 
-// MNILU Stage: loop bound adjusted to 1, transfer widened to [1, 64, 64]
-// CHECK:      ktdf.stage
+// CHECK:      ktdf.tiling.reserve_size {divisibility = 1 : index, min_value = 1 : index} : index
+// CHECK:      ktdf.tiling.reserve_size {divisibility = 64 : index, min_value = 64 : index} : index
+// CHECK:      %[[PRIV:.*]]:4 = ktdf.private -> (memref<?x?x1x64x64xf16, "L1">, memref<?x?x1x64x64xf16, "L1">, !ktdf.token, !ktdf.token)
+
+// MNILU stage: the whole tile.
+// CHECK:      ktdf.stage depends_in(none) depends_out(%[[PRIV]]#2) {
 // CHECK:        scf.for %[[ARG2:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
 // CHECK:          scf.for %[[ARG3:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
 // CHECK:            ktdf.data_transfer from %{{.*}} size [1, 64, 64] to %[[PRIV]]#0[%[[ARG2]], %[[ARG3]], 0, 0, 0] size [1, 1, 1, 64, 64]
 
-// Middle Stage: nested pipeline wrapped with element loops for scalar processing
-// CHECK:      ktdf.stage
+// Middle stage: per element, at the tile's own indices.
+// CHECK:      ktdf.stage depends_in(%[[PRIV]]#2) depends_out(%[[PRIV]]#3) {
 // CHECK:        scf.for %[[ARG2:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
 // CHECK:          scf.for %[[ARG3:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
-// CHECK:            scf.for %[[ARG4:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
-// CHECK:              scf.for %[[ARG5:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
-// CHECK:                ktdf.pipeline {
-// CHECK:                  ktdf.stage {{.*}} {
-// CHECK:                    ktdf.data_transfer from %[[PRIV]]#0[0, 0, 0, %[[ARG4]], %[[ARG5]]] size [1, 1, 1, 1, 1] to %{{.*}} size [64] {transfer_mode = "splat"}
-// CHECK:                  }
-// CHECK:                  ktdf.stage
-// CHECK:                  ktdf.stage {{.*}} {
-// CHECK:                    ktdf.data_transfer from %{{.*}} size [1] to %[[PRIV]]#1[0, 0, 0, %[[ARG5]], %[[ARG4]]] size [1, 1, 1, 1, 64]
-// CHECK:                  }
-// CHECK:                }
-// CHECK:              }
-// CHECK:            }
-// CHECK:          }
-// CHECK:        }
+// CHECK:            scf.for %[[T:.*]] = %{{.*}} to %c64{{[_0-9]*}} step %{{.*}} {
+// CHECK:              scf.for %[[C:.*]] = %{{.*}} to %c64{{[_0-9]*}} step %{{.*}} {
+// CHECK:                ktdf.data_transfer from %[[PRIV]]#0[%[[ARG2]], %[[ARG3]], 0, %[[C]], %[[T]]] size [1, 1, 1, 1, 1] to %{{.*}} size [64] {transfer_mode = "splat"}
+// CHECK:                ktdf.data_transfer from %{{.*}} size [64] to %[[PRIV]]#1[%[[ARG2]], %[[ARG3]], 0, %[[T]], %[[C]]] size [1, 1, 1, 1, 1] :
 
-// MNISU Stage: loop bound adjusted to 1, transfer widened to [1, 64, 64]
-// CHECK:      ktdf.stage
+// MNISU stage: the whole tile.
+// CHECK:      ktdf.stage depends_in(%[[PRIV]]#3) depends_out(none) {
 // CHECK:        scf.for %[[ARG2:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
 // CHECK:          scf.for %[[ARG3:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
 // CHECK:            ktdf.data_transfer from %[[PRIV]]#1[%[[ARG2]], %[[ARG3]], 0, 0, 0] size [1, 1, 1, 64, 64] to %{{.*}} size [1, 64, 64]
