@@ -151,7 +151,8 @@ struct TileSizeSelectionPass
               << "[" PASS_NAME "] no tile size satisfies min_value = "
               << constraints.getMinValue()
               << ", divisibility = " << constraints.getDivisibility()
-              << " and the totals of the loops it tiles";
+              << ", the totals of the loops it tiles and the instances the "
+                 "loops it bounds are distributed across";
           return signalPassFailure();
         }
       }

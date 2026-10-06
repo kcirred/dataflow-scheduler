@@ -1,24 +1,24 @@
 // RUN: dataflow-scheduler-opt -allow-unregistered-dialect  -parallelize-loops-across-instances %s | FileCheck %s
 
+// Loop bounds depend on a function argument. The trip count is not built from
+// a tile size, so nothing can make it a multiple of num_instances, and
+// lowering also requires a constant trip count to distribute. The loop is not
+// split.
+
 // CHECK-LABEL:   func.func @dynamic_trip(
 // CHECK-SAME:      %[[ARG0:.*]]: index) {
 // CHECK-NEXT:     %[[CONSTANT_0:.*]] = arith.constant 0 : index
 // CHECK-NEXT:     %[[CONSTANT_1:.*]] = arith.constant 1 : index
-// CHECK-NEXT:     ktdf.parallel (%[[VAL_0:.*]], %[[VAL_1:.*]]) = (%[[CONSTANT_0]]) to (%[[ARG0]]) step (%[[CONSTANT_1]]) distribute(num_instances = 2) {
+// CHECK-NEXT:     scf.for %[[VAL_0:.*]] = %[[CONSTANT_0]] to %[[ARG0]] step %[[CONSTANT_1]] {
 // CHECK-NEXT:       ktdf.pipeline {
 // CHECK-NEXT:         ktdf.stage depends_in(none) depends_out(none) {
 // CHECK-NEXT:           "test.body"(%[[VAL_0]]) : (index) -> ()
 // CHECK-NEXT:         } {applicable_units = ["SFU"]}
 // CHECK-NEXT:       }
-// CHECK-NEXT:       ktdf.parallel_yield
-// CHECK-NEXT:     }
+// CHECK-NEXT:     } {loop_type = #ktdf.loop_type<parallel_loop>}
 // CHECK-NEXT:     return
 // CHECK-NEXT:   }
-
-
-
-// Loop bounds depend on a function argument. Trip count not statically
-// known but still a candidate.
+// CHECK-NOT:      ktdf.parallel
 
 module {
   ktdf_arch.device @sample_device attributes {} import("../../Dialect/KTDFArch/sample_device.mlir")

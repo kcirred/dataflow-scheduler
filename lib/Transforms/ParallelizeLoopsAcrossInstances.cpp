@@ -24,6 +24,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/SetVector.h>
 
 #include <optional>
@@ -31,6 +32,7 @@
 #include "dataflow-scheduler/Analysis/Mapping.h"
 #include "dataflow-scheduler/Dialect/KTDF/Analysis/ApplicableUnits.h"
 #include "dataflow-scheduler/Dialect/KTDF/Analysis/PipelineScope.h"
+#include "dataflow-scheduler/Dialect/KTDF/Analysis/TileSizeConstraints.h"
 #include "dataflow-scheduler/Dialect/KTDF/Analysis/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/NodeEndpoints.h"
@@ -68,16 +70,6 @@ using namespace scheduler;
 namespace {
 
 //===----------------------------------------------------------------------===//
-// Balance Status Enum
-//===----------------------------------------------------------------------===//
-
-enum class BalanceStatus {
-  kBalanced,       // Trip count is evenly divisible by num_instances
-  kUnbalanced,     // Trip count is not evenly divisible by num_instances
-  kBalanceUnknown  // Trip count is dynamic, balance cannot be determined
-};
-
-//===----------------------------------------------------------------------===//
 // Candidate
 //===----------------------------------------------------------------------===//
 
@@ -88,9 +80,6 @@ struct Candidate {
   mlir::Value upper_bound;
   // Static trip count if known
   std::optional<int64_t> trip_count;
-  // Balance status indicating whether trip count is evenly divisible by
-  // num_instances
-  BalanceStatus balance_status;
   // Collection of groups this candidate can be mapped to.
   llvm::SmallSetVector<mlir::ktdf_arch::GroupOp, 4> applicable_groups;
 };
@@ -199,11 +188,24 @@ std::optional<mlir::scf::ForOp> firstMatching(
   return std::nullopt;
 }
 
-/// Three-pass loop selection: balanced first, imbalanced fallback, dynamic
-/// last.
+/// Requirements already placed on tile sizes by the splits chosen in this run,
+/// which are only rewritten into ktdf.parallel after all are chosen.
+using PendingRequirements =
+    llvm::DenseMap<mlir::Operation*, mlir::ktdf::TileSizeRequirement>;
+
+/// Two-pass loop selection, outermost first. Only a split that gives every
+/// instance the same number of iterations is picked: lowering distributes a
+/// constant trip count that is a multiple of num_instances, and nothing else.
+///   1. A static trip count that is a multiple of num_instances.
+///   2. A dynamic trip count built from a tile size that can still be chosen
+///      to make it one (see mlir::ktdf::getSplitRequirement); tile size
+///      selection then honors that, because the ktdf.parallel this split
+///      becomes states it.
+/// A dynamic trip count that is not built from a tile size, or whose tile
+/// size cannot satisfy the split, is not picked.
 std::optional<mlir::scf::ForOp> selectLoop(
     llvm::ArrayRef<mlir::scf::ForOp> scope_loops_innermost_first,
-    unsigned num_instances) {
+    unsigned num_instances, PendingRequirements& pending) {
   // Pass 1: trip >= N and trip % N == 0 (balanced static).
   auto balanced = firstMatching(
       scope_loops_innermost_first,
@@ -215,26 +217,40 @@ std::optional<mlir::scf::ForOp> selectLoop(
   if (balanced.has_value()) {
     return balanced;
   }
-  // Pass 2: trip >= N (imbalanced static).
-  auto imbalanced = firstMatching(
+  // Pass 2: a dynamic trip count that tiling can make balanced.
+  auto tiled = firstMatching(
       scope_loops_innermost_first,
-      [num_instances](mlir::scf::ForOp, std::optional<int64_t> trip) {
-        if (!trip.has_value()) return false;
-        return *trip >= static_cast<int64_t>(num_instances);
+      [&](mlir::scf::ForOp loop, std::optional<int64_t> trip) {
+        if (trip.has_value()) return false;
+        auto split = mlir::ktdf::getSplitRequirement(loop.getUpperBound(),
+                                                     num_instances);
+        if (!split || split->impossible) {
+          LDBG(1) << " skip loop at " << loop.getLoc()
+                  << ": dynamic trip count cannot be made a multiple of "
+                  << num_instances;
+          return false;
+        }
+        mlir::Operation* reserve = split->reserve_size_op.getOperation();
+        auto requirement = split->requirement;
+        if (auto it = pending.find(reserve); it != pending.end())
+          requirement = requirement.combine(it->second);
+        if (!mlir::ktdf::TileSizeConstraints(split->reserve_size_op)
+                 .isFeasible(requirement)) {
+          LDBG(1) << " skip loop at " << loop.getLoc()
+                  << ": no tile size makes its trip count a multiple of "
+                  << num_instances;
+          return false;
+        }
+        pending[reserve] = requirement;
+        return true;
       });
-  if (imbalanced.has_value()) {
-    return imbalanced;
-  }
-  // Pass 3: dynamic loops (balance unknown).
-  return firstMatching(scope_loops_innermost_first,
-                       [](mlir::scf::ForOp, std::optional<int64_t> trip) {
-                         return !trip.has_value();
-                       });
+  return tiled;
 }
 
 std::optional<Candidate> findCandidate(
     mlir::ktdf::PipelineOp pipeline,
-    const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
+    const mlir::ktdf_arch::ResourceKinds& resource_kinds,
+    PendingRequirements& pending) {
   // Step 1+2: applicable_units.
   auto enclosing_group = findEnclosingGroup(pipeline, resource_kinds);
   if (!enclosing_group) {
@@ -259,7 +275,7 @@ std::optional<Candidate> findCandidate(
   }
 
   // Step 4: loop selection.
-  auto picked = selectLoop(scope.loops, num_instances);
+  auto picked = selectLoop(scope.loops, num_instances, pending);
   if (!picked.has_value()) {
     LDBG(1) << "skip pipeline at " << pipeline.getLoc()
             << ": no parallel loop in scope satisfies requirements";
@@ -269,34 +285,17 @@ std::optional<Candidate> findCandidate(
   mlir::Value upper_bound = loop.getUpperBound();
   auto trip = getStaticTripCount(loop);
 
-  BalanceStatus balance_status;
   if (trip.has_value()) {
-    // Static trip count - determine balance
-    bool balanced = (*trip % static_cast<int64_t>(num_instances)) == 0;
-    balance_status =
-        balanced ? BalanceStatus::kBalanced : BalanceStatus::kUnbalanced;
-
-    if (!balanced) {
-      int64_t chunk = (*trip + num_instances - 1) / num_instances;
-      int64_t leftover = *trip - (num_instances - 1) * chunk;
-      LDBG(1) << " imbalanced (fallback) at " << loop.getLoc()
-              << ": trip=" << *trip << ", num_instances=" << num_instances
-              << ", chunks=" << chunk << "," << leftover;
-    } else {
-      LDBG(1) << " balanced candidate at " << loop.getLoc()
-              << ": trip=" << *trip << ", num_instances=" << num_instances;
-    }
-  } else {
-    // Dynamic trip count - balance unknown
-    balance_status = BalanceStatus::kBalanceUnknown;
-
-    LDBG(1) << " dynamic candidate at " << loop.getLoc()
-            << ": trip count is dynamic"
+    LDBG(1) << " balanced candidate at " << loop.getLoc() << ": trip=" << *trip
             << ", num_instances=" << num_instances;
+  } else {
+    LDBG(1) << " tiled candidate at " << loop.getLoc()
+            << ": trip count is a tile size constrained to a multiple of "
+            << num_instances;
   }
 
-  return Candidate{pipeline, loop,           upper_bound,
-                   trip,     balance_status, std::move(applicable_groups)};
+  return Candidate{pipeline, loop, upper_bound, trip,
+                   std::move(applicable_groups)};
 }
 
 //===----------------------------------------------------------------------===//
@@ -378,9 +377,10 @@ struct ParallelizeLoopsAcrossInstancesPass
     // Pre-order walk over pipelines. Collect candidates first, then rewrite,
     // so the walk's iterator is not invalidated by op erasure.
     llvm::SmallVector<Candidate> candidates;
+    PendingRequirements pending;
     module_op.walk<mlir::WalkOrder::PreOrder>(
         [&](mlir::ktdf::PipelineOp pipeline) {
-          if (auto c = findCandidate(pipeline, resource_kinds)) {
+          if (auto c = findCandidate(pipeline, resource_kinds, pending)) {
             candidates.push_back(*c);
           }
         });
