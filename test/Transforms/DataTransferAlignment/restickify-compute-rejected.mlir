@@ -1,14 +1,15 @@
 // RUN: dataflow-scheduler-opt --data-transfer-alignment %s -verify-diagnostics
 
-// The issue #39 copy, but its nested compute stage squares each element on the
-// way through. The two-phase re-stickify only re-sticks a copy: phase 1's
-// compute stage is replaced by the merge that assembles a slice.
-//
-// PURPOSE: the rewrite is refused with a diagnostic rather than dropping the
-// computation. Catches a rewrite that replaces a computing stage's body.
+// PURPOSE: a re-stick whose nested compute stage squares each element on the
+// way through, instead of passing it on unchanged. The element-level
+// transpose turns the load into a one-element broadcast and the store into a
+// one-element write, which is shown correct only for a pass-through stage, so
+// the rewrite is refused with a diagnostic at the compute stage. Catches
+// rewriting the transfers around a computing stage without a correctness
+// argument for what that stage then does to the broadcast vector.
 #set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 11 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 
-ktdf_arch.device @sample_device attributes {mem_space_mapping = #ktdf_arch.map<#ktdp.memory_space<global> = "DDR", #ktdp.memory_space<ct_local> = "L1">} import("../../Dialect/KTDFArch/restickify_device.mlir")
+ktdf_arch.device @sample_device attributes {mem_space_mapping = #ktdf_arch.map<#ktdp.memory_space<global> = "DDR", #ktdp.memory_space<ct_local> = "L1">} import("../../Dialect/KTDFArch/sample_device.mlir")
 
 module {
   module {

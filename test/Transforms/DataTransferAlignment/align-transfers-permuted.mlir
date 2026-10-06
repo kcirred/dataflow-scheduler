@@ -16,7 +16,7 @@
 // The output view is row-major already and is left alone.
 // CHECK:      ktdp.construct_memory_view %{{.*}}, sizes: [4, 2, 64, 64], strides: [8192, 4096, 64, 1]
 
-// The tile of the contiguous dim is constrained to whole 64-element blocks.
+// The tile of the contiguous dim is pinned to the whole 64-point dimension.
 // CHECK:      %[[TS_M:.*]] = ktdf.tiling.reserve_size {divisibility = 1 : index, min_value = 1 : index}
 // CHECK-NEXT: %[[TS_N:.*]] = ktdf.tiling.reserve_size {divisibility = 1 : index, min_value = 1 : index}
 // CHECK-NEXT: %[[TS_P:.*]] = ktdf.tiling.reserve_size {divisibility = 64 : index, min_value = 64 : index}

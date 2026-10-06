@@ -33,7 +33,6 @@
 #include <algorithm>
 #include <limits>
 #include <memory>
-#include <numeric>
 
 #include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
 #include "dataflow-scheduler/Analysis/Utils.h"
@@ -71,6 +70,27 @@ namespace {
 
 /// Identifies illegal ktdf.data_transfer ops and builds a per-pipeline
 /// analysis tree used by the corrective rewrite phase.
+/// Reports that `op` stores into a global view whose innermost stride is not
+/// 1. The re-stickify reads a strided source and transposes it on chip before
+/// the store; a strided destination would need a second, store-side
+/// transpose, which is not built, so it is refused rather than stored with
+/// its sticks in the wrong order.
+static mlir::InFlightDiagnostic emitStridedDestinationError(
+    mlir::ktdf::DataTransferOp op, mlir::MemRefType destination) {
+  llvm::SmallVector<int64_t> strides;
+  int64_t offset = 0;
+  int64_t innermost = 1;
+  if (mlir::succeeded(destination.getStridesAndOffset(strides, offset)) &&
+      !strides.empty())
+    innermost = strides.back();
+  return op->emitError(PASS_NAME ": destination memory view has innermost "
+                                 "stride ")
+         << innermost
+         << "; only a source view can be re-stuck (the on-chip transpose "
+            "follows the load), got "
+         << destination;
+}
+
 class DataTransferLegality {
  public:
   struct PipelineAnalysis;  // forward declaration, mutually recursive with
@@ -199,6 +219,14 @@ class DataTransferLegality {
             use_dest
                 ? mlir::cast<mlir::MemRefType>(dt.getDestination().getType())
                 : mlir::cast<mlir::MemRefType>(dt.getSource().getType());
+        // The on-chip transpose follows the load, so only the source of a
+        // re-stickify can be strided. A strided destination would need a
+        // second, store-side transpose, which is not built.
+        if (use_dest) {
+          emitStridedDestinationError(dt, strided_memref);
+          pa.has_error = true;
+          break;
+        }
         auto space = strided_memref.getMemorySpace();
         auto elem_bytes =
             scheduler::tryGetSizeInBytes(strided_memref.getElementType());
@@ -839,8 +867,8 @@ static void widenAlloc(const DataTransferLegality::TransferStep& ts,
     // The staging buffer is the transfer's block shape (one dim per view dim,
     // trailing) behind its tile dims. Widen the block along p, and shrink p's
     // tile dim (pa.lx_tile_pos) by the same factor: each slot now holds
-    // alignment_factor of p's points, and adjustLoopBounds makes p's tile a
-    // multiple of alignment_factor.
+    // alignment_factor of p's points, and adjustLoopBounds pins p's tile to
+    // the whole dimension, a multiple of alignment_factor.
     int64_t rank = orig_type.getRank();
     int64_t alloc_dim = rank - pa.view_rank + pa.perm_p;
     int64_t tile_dim = pa.lx_tile_pos;
@@ -938,36 +966,43 @@ static mlir::scf::ForOp findPointLoop(
   return point_loop;
 }
 
-/// Makes the tile behind `tile_size` hold whole aligned blocks: a
-/// ktdf.tiling.reserve_size is constrained to a multiple of alignment_factor
-/// before tile size selection runs; an already chosen constant tile size is
-/// checked instead.
-static mlir::LogicalResult constrainTileToAlignedBlocks(
-    mlir::Value tile_size, int64_t alignment_factor, mlir::Operation* anchor,
-    mlir::OpBuilder& builder) {
+/// Pins the tile behind `tile_size` to `total`, the whole extent of the
+/// dimension it tiles, so the tile loop runs once. A ktdf.tiling.reserve_size
+/// gets min_value = divisibility = total, before tile size selection runs; an
+/// already chosen constant tile size must equal total. Fails, with a
+/// diagnostic, when the reserve_size already carries a constraint that total
+/// does not meet (a divisibility that does not divide it, or a larger
+/// minimum), instead of overwriting that constraint.
+static mlir::LogicalResult pinTileToWholeDimension(mlir::Value tile_size,
+                                                   int64_t total,
+                                                   mlir::Operation* anchor,
+                                                   mlir::OpBuilder& builder) {
   mlir::Operation* def = tile_size.getDefiningOp();
   if (auto reserve =
           mlir::dyn_cast_or_null<mlir::ktdf::TilingReserveSizeOp>(def)) {
-    int64_t divisibility =
-        std::lcm(reserve.getDivisibility().getSExtValue(), alignment_factor);
-    int64_t min_value =
-        std::max(reserve.getMinValue().getSExtValue(), alignment_factor);
-    reserve.setDivisibilityAttr(builder.getIndexAttr(divisibility));
-    reserve.setMinValueAttr(builder.getIndexAttr(min_value));
-    LDBG(1) << "  constrainTileToAlignedBlocks: " << reserve;
+    const int64_t divisibility = reserve.getDivisibility().getSExtValue();
+    const int64_t min_value = reserve.getMinValue().getSExtValue();
+    if (divisibility <= 0 || total % divisibility != 0 || min_value > total) {
+      return anchor->emitError(PASS_NAME ": cannot pin the tile to the whole "
+                                         "dimension (")
+             << total << "): its tile size is already constrained to "
+             << "divisibility " << divisibility << ", min_value " << min_value;
+    }
+    reserve.setDivisibilityAttr(builder.getIndexAttr(total));
+    reserve.setMinValueAttr(builder.getIndexAttr(total));
+    LDBG(1) << "  pinTileToWholeDimension: " << reserve;
     return mlir::success();
   }
   if (auto cst = mlir::dyn_cast_or_null<mlir::arith::ConstantIndexOp>(def)) {
-    if (cst.value() % alignment_factor == 0) return mlir::success();
+    if (cst.value() == total) return mlir::success();
     return anchor->emitError(PASS_NAME ": tile size (")
-           << cst.value() << ") is not a multiple of alignment factor "
-           << alignment_factor;
+           << cst.value() << ") is not the whole dimension (" << total << ")";
   }
-  return anchor->emitError(
-             PASS_NAME
-             ": tile size is neither a ktdf.tiling.reserve_size nor a constant "
-             "— cannot constrain it to alignment_factor=")
-         << alignment_factor;
+  return anchor->emitError(PASS_NAME
+                           ": tile size is neither a ktdf.tiling.reserve_size "
+                           "nor a constant; cannot pin it to the whole "
+                           "dimension (")
+         << total << ")";
 }
 
 /// Checks that `total_size`, a dimension's full trip count, is a constant
@@ -994,11 +1029,17 @@ static mlir::LogicalResult checkTotalDivisible(mlir::Value total_size,
   return mlir::success();
 }
 
-/// Point loop of a tiled dimension: its bound `derive` is the extent of one
-/// tile, so the tile is constrained to whole aligned blocks, the per-tile trip
-/// count is divided by alignment_factor, and the loop's stride in every
-/// ktdf.tiling.linearize_index is scaled by alignment_factor so that each
-/// iteration advances one aligned block in the original iteration space.
+/// Point loop of a tiled dimension, whose bound `derive` is the extent of one
+/// tile. Each widened transfer covers alignment_factor of the dimension's
+/// points, so the tile is pinned to the whole dimension (the tile loop runs
+/// once), the loop's bound becomes the constant total / alignment_factor, and
+/// its stride in every ktdf.tiling.linearize_index is scaled by
+/// alignment_factor so that each iteration advances one aligned block in the
+/// original iteration space. For the contiguous dim the total is one block, so
+/// the loop runs once. Tiling the dimension more finely buys nothing: splitting
+/// it across corelets is a tiling constraint of its own (see
+/// ParallelizeLoopsAcrossInstances), and a pinned tile that conflicts with one
+/// is reported by pinTileToWholeDimension.
 static mlir::LogicalResult adjustTiledLoopBound(
     mlir::scf::ForOp loop, mlir::ktdf::TilingDeriveSizeOp derive,
     int64_t alignment_factor, mlir::OpBuilder& builder) {
@@ -1007,21 +1048,23 @@ static mlir::LogicalResult adjustTiledLoopBound(
                                        "ktdf.tiling.derive_size total_size")))
     return mlir::failure();
 
-  // The innermost tile size is the extent this loop walks.
-  if (mlir::failed(constrainTileToAlignedBlocks(
-          derive.getTileSizes().back(), alignment_factor, loop, builder)))
-    return mlir::failure();
+  // checkTotalDivisible has verified total_size is a constant multiple of
+  // alignment_factor, so the bound below is exact.
+  const int64_t total =
+      mlir::cast<mlir::arith::ConstantIndexOp>(
+          derive.getTotalSize().getDefiningOp())
+          .value();
+  for (mlir::Value tile_size : derive.getTileSizes())
+    if (mlir::failed(pinTileToWholeDimension(tile_size, total, loop, builder)))
+      return mlir::failure();
 
-  // Both the full tile and the epilogue remainder are multiples of
-  // alignment_factor (the tile is constrained, the total checked above), so the
-  // division is exact.
   builder.setInsertionPoint(loop);
   mlir::Value c_factor = mlir::arith::ConstantIndexOp::create(
                              builder, loop.getLoc(), alignment_factor)
                              .getResult();
-  loop.setUpperBound(
-      mlir::arith::DivUIOp::create(builder, loop.getLoc(), derive, c_factor)
-          .getResult());
+  loop.setUpperBound(mlir::arith::ConstantIndexOp::create(
+                         builder, loop.getLoc(), total / alignment_factor)
+                         .getResult());
 
   mlir::Value iv = loop.getInductionVar();
   for (mlir::Operation* user : llvm::to_vector(iv.getUsers())) {
@@ -1048,8 +1091,9 @@ static mlir::LogicalResult adjustTiledLoopBound(
     }
   }
 
-  LDBG(1) << "  adjustTiledLoopBound: per-tile trip count / alignment_factor="
-          << alignment_factor << " at " << loop.getLoc();
+  LDBG(1) << "  adjustTiledLoopBound: tile pinned to " << total
+          << ", trip count " << total / alignment_factor << " at "
+          << loop.getLoc();
   return mlir::success();
 }
 
@@ -1298,13 +1342,20 @@ static mlir::LogicalResult rewriteTransferShape(
 
   auto rewrite_side = [&](mlir::Value val,
                           llvm::SmallVector<mlir::OpFoldResult>& sizes,
-                          mlir::AffineMap& map) -> mlir::LogicalResult {
+                          mlir::AffineMap& map,
+                          bool is_destination) -> mlir::LogicalResult {
     if (!mlir::isa<mlir::MemRefType>(val.getType())) return mlir::success();
     int64_t rank = (int64_t)sizes.size();
 
     // The strided view is the one whose own innermost stride is not 1, or
     // that an earlier transfer already reordered.
     auto construct = findConstructMemoryView(val, memory_tree);
+    if (is_destination && construct &&
+        construct.getStaticStrides().back() != 1) {
+      emitStridedDestinationError(
+          op, mlir::cast<mlir::MemRefType>(construct.getResult().getType()));
+      return mlir::failure();
+    }
     const llvm::SmallVector<int64_t>* order = nullptr;
     if (construct) {
       auto it = view_orders.find(construct.getOperation());
@@ -1332,8 +1383,10 @@ static mlir::LogicalResult rewriteTransferShape(
     return mlir::success();
   };
 
-  if (mlir::failed(rewrite_side(op.getSource(), new_src_sizes, src_map)) ||
-      mlir::failed(rewrite_side(op.getDestination(), new_dst_sizes, dst_map)))
+  if (mlir::failed(rewrite_side(op.getSource(), new_src_sizes, src_map,
+                                /*is_destination=*/false)) ||
+      mlir::failed(rewrite_side(op.getDestination(), new_dst_sizes, dst_map,
+                                /*is_destination=*/true)))
     return mlir::failure();
 
   auto new_op = replaceTransfer(op, src_map, new_src_sizes, dst_map,
@@ -1597,6 +1650,52 @@ static void insertLoopAroundPipeline(
           << bound << ") around nested pipeline at " << loc;
 }
 
+/// Checks that `pipeline`, the nested pipeline of an element-level transpose,
+/// only moves data: one stage with a single transfer into a FIFO (the load),
+/// one compute stage whose body is exactly one ktdf.read_from_fifo written back
+/// unchanged by one ktdf.write_to_fifo, and one stage with a single transfer out
+/// of a FIFO (the store). The rewrite turns the load into a one-element splat
+/// and the store into a one-element write; a compute stage that does anything
+/// else would then run on the broadcast vector, which is not shown correct, so
+/// it is refused with a diagnostic instead of rewritten.
+static mlir::LogicalResult checkPassThroughNestedPipeline(
+    mlir::ktdf::PipelineOp pipeline) {
+  bool has_load = false, has_compute = false, has_store = false;
+  for (mlir::Operation& op : pipeline.getBody()->getOperations()) {
+    auto stage = mlir::dyn_cast<mlir::ktdf::StageOp>(op);
+    if (!stage) continue;
+    llvm::SmallVector<mlir::ktdf::DataTransferOp> transfers;
+    stage.walk([&](mlir::ktdf::DataTransferOp t) { transfers.push_back(t); });
+    auto reads =
+        llvm::to_vector(stage.getBody()->getOps<mlir::ktdf::ReadFromFifoOp>());
+    if (transfers.size() == 1 && transfers[0].isDestFifo()) {
+      has_load = true;
+    } else if (transfers.size() == 1 && transfers[0].isSourceFifo()) {
+      has_store = true;
+    } else if (transfers.empty() && reads.size() == 1) {
+      auto writes =
+          llvm::to_vector(stage.getBody()->getOps<mlir::ktdf::WriteToFifoOp>());
+      const auto body_ops =
+          std::distance(stage.getBody()->begin(), stage.getBody()->end());
+      if (writes.size() != 1 || writes[0].getData() != reads[0].getResult() ||
+          body_ops != 2) {
+        return stage->emitError(PASS_NAME
+                                ": re-stickify needs a pass-through compute "
+                                "stage (one read_from_fifo written back "
+                                "unchanged); this one computes");
+      }
+      has_compute = true;
+    }
+  }
+  if (!has_load || !has_compute || !has_store) {
+    return pipeline->emitError(PASS_NAME
+                               ": re-stickify needs a nested pipeline of one "
+                               "load, one pass-through compute and one store "
+                               "stage");
+  }
+  return mlir::success();
+}
+
 /// Applies corrective rewrites to the PipelineAnalysis tree: inserts a loop
 /// around nested pipelines, then for each leaf stage adjusts the loop bound
 /// and rewrites every transfer shape (illegal/displaced → widen; memref→FIFO
@@ -1626,6 +1725,10 @@ static mlir::LogicalResult fixPipeline(
     }
 
     if (sa.nested_pipeline != nullptr) {
+      if (mlir::failed(
+              checkPassThroughNestedPipeline(sa.nested_pipeline->pipeline)))
+        return mlir::failure();
+
       // Collapse the tile loop enclosing the nested pipeline to ub=1 so the
       // only column iteration is the element loop inserted below.
       if (mlir::failed(adjustLoopBounds(sa, pa, builder)))

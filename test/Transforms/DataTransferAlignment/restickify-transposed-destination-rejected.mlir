@@ -2,16 +2,10 @@
 
 // PURPOSE: a destination whose sticks run across its last dimension (strides
 // [4096, 1, 64]) would need a second, store-side transpose, which DTA does not
-// build. It is rejected with a diagnostic. Catches the row-major rewrite that
-// turned these strides into [4096, 64, 1] and stored transposed data with no
-// error.
-
-
-
-
-
-
-
+// build. It is rejected with a diagnostic at the store. Catches storing it
+// with no error after rewriting the destination view: to row-major
+// ([4096, 64, 1], as PR 168 did) or to memory order, either of which writes
+// the data transposed.
 
 #set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 

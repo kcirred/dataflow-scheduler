@@ -6,8 +6,8 @@
 // dim (d1, stride 1) and its lane (d2): their strides are exchanged.
 // CHECK:      ktdp.construct_memory_view %{{.*}}, sizes: [12, 64, 64], strides: [4096, 64, 1]
 
-// The tile of the aligned dimension is constrained to whole 64-element blocks,
-// so tile size selection cannot split one:
+// The tile of the aligned dimension is pinned to the whole 64-point dimension,
+// so tile size selection cannot split the block the widened transfers cover:
 // CHECK:      %[[TS0:.*]] = ktdf.tiling.reserve_size {divisibility = 1 : index, min_value = 1 : index}
 // CHECK:      %[[TS1:.*]] = ktdf.tiling.reserve_size {divisibility = 64 : index, min_value = 64 : index}
 
@@ -20,13 +20,13 @@
 // CHECK-NEXT:   %[[A1:.*]] = memref.alloc(%[[TS0]], %[[NB1]]) : memref<?x?x1x64x64xf16, "L1">
 // CHECK:        ktdf.private_yield %[[A0]], %[[A1]]
 
-// MNILU Stage: per-tile trip count divided by 64, each iteration advances one
-// 64-point block, transfer widened to [1, 64, 64]. On the swapped view the
-// block index of d1 moves to d2 with its stride.
+// MNILU Stage: the point loop runs 64 / 64 = 1 time (a constant bound, since
+// the tile is the whole dimension), each iteration advances one 64-point
+// block, transfer widened to [1, 64, 64]. On the swapped view the block index
+// of d1 moves to d2 with its stride.
 // CHECK:      ktdf.stage
 // CHECK:        scf.for %[[ARG2:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
-// CHECK:          %[[NB:.*]] = arith.divui %{{.*}}, %{{.*}} : index
-// CHECK-NEXT:     scf.for %[[ARG3:.*]] = %{{.*}} to %[[NB]] step %{{.*}} {
+// CHECK:          scf.for %[[ARG3:.*]] = %{{.*}} to %c1{{(_[0-9]+)?}} step %{{.*}} {
 // CHECK:            %[[IDX:.*]] = ktdf.tiling.linearize_index [%{{.*}} : %[[TS1]]], [%[[ARG3]] : %c64{{.*}}] : index
 // CHECK-NEXT:       ktdf.data_transfer from %{{.*}}[%{{.*}}, %{{.*}}, %[[IDX]]] size [1, 64, 64] to %[[PRIV]]#0[%[[ARG2]], %[[ARG3]], 0, 0, 0] size [1, 1, 1, 64, 64]
 
@@ -51,12 +51,11 @@
 // CHECK:          }
 // CHECK:        }
 
-// MNISU Stage: per-tile trip count divided by 64, each iteration advances one
-// 64-point block, transfer widened to [1, 64, 64]
+// MNISU Stage: the point loop runs once, each iteration advances one 64-point
+// block, transfer widened to [1, 64, 64]
 // CHECK:      ktdf.stage
 // CHECK:        scf.for %[[ARG2:.*]] = %{{.*}} to %{{.*}} step %{{.*}} {
-// CHECK:          %[[NB:.*]] = arith.divui %{{.*}}, %{{.*}} : index
-// CHECK-NEXT:     scf.for %[[ARG3:.*]] = %{{.*}} to %[[NB]] step %{{.*}} {
+// CHECK:          scf.for %[[ARG3:.*]] = %{{.*}} to %c1{{(_[0-9]+)?}} step %{{.*}} {
 // CHECK:            %[[IDX:.*]] = ktdf.tiling.linearize_index [%{{.*}} : %[[TS1]]], [%[[ARG3]] : %c64{{.*}}] : index
 // CHECK-NEXT:       ktdf.data_transfer from %[[PRIV]]#1[%[[ARG2]], %[[ARG3]], 0, 0, 0] size [1, 1, 1, 64, 64] to %{{.*}}[%{{.*}}, %[[IDX]], %{{.*}}] size [1, 64, 64]
 
