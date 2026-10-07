@@ -5,12 +5,13 @@
 // torch-spyre's layout: the last (stick) dim stays last and only the outer two
 // swap. Every transfer is one contiguous 64-element stick, so nothing is
 // widened, but the input view's strides [64, 4096, 4096, 1] do not decrease,
-// which the device compiler rejects. Checks that the input is re-expressed as a
-// second view in decreasing-stride order ([4096, 4096, 64, 1]), that the
-// tile-size constraints stay free, and that the nested transfers keep moving
-// whole 64-element sticks with no splat. Catches leaving transfers in
-// pipelines that need no widening unreordered ("Extent in load/store set is
-// larger than from the layout").
+// which the device compiler rejects. Checks that the input view is rewritten
+// into memory order ([1, 64, 64, 64], strides [4096, 4096, 64, 1]) with the
+// load's first two subscripts exchanged, that the tile-size constraints stay
+// free, and that the nested transfers keep moving whole 64-element sticks with
+// no splat. Catches leaving a view out of memory order on a pipeline that
+// needs no widening ("Extent in load/store set is larger than from the
+// layout").
 //
 // The input is the scheduler IR that DataTransferAlignment received for a
 // kernel that ran correctly on Spyre DD2 (exact compare against numpy), printed
@@ -21,12 +22,13 @@
 // this device matches its output on DD2 apart from those names.
 
 // CHECK-LABEL: func.func @local_schedule_0(
-// CHECK:       ktdp.construct_memory_view %arg0, sizes: [64, 1, 64, 64], strides: [64, 4096, 4096, 1]
 // CHECK:       ktdp.construct_memory_view %arg0, sizes: [1, 64, 64, 64], strides: [4096, 4096, 64, 1]
 // CHECK:       ktdp.construct_memory_view %arg1, sizes: [64, 1, 64, 64], strides: [4096, 4096, 64, 1]
 // CHECK:       ktdf.tiling.reserve_size {divisibility = 1 : index, min_value = 1 : index} : index
 // CHECK-NEXT:  ktdf.tiling.reserve_size {divisibility = 1 : index, min_value = 1 : index} : index
-// CHECK:       ktdf.data_transfer from %{{.*}}[%c0, %{{.*}}, %{{.*}}, %c0 * 64] size [1, 1, 1, 64] to %{{.*}} size [1, 1, 1, 1, 1, 64]
+// CHECK:       %[[I:.*]] = ktdf.tiling.linearize_index
+// CHECK:       %[[J:.*]] = ktdf.tiling.linearize_index
+// CHECK-NEXT:  ktdf.data_transfer from %{{.*}}[%c0, %[[J]], %[[I]], %c0 * 64] size [1, 1, 1, 64] to %{{.*}} size [1, 1, 1, 1, 1, 64]
 // CHECK:       ktdf.data_transfer from %{{.*}} size [1, 1, 1, 1, 1, 64] to %{{.*}} size [64] :
 // CHECK:       ktdf.data_transfer from %{{.*}} size [64] to %{{.*}} size [1, 1, 1, 1, 1, 64] :
 // CHECK:       ktdf.data_transfer from %{{.*}} size [1, 1, 1, 1, 1, 64] to %{{.*}}[%{{.*}}, %c0, %{{.*}}, %c0 * 64] size [1, 1, 1, 64]

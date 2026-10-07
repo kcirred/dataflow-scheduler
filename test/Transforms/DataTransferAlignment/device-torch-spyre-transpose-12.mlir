@@ -3,15 +3,14 @@
 // PURPOSE: torch-spyre's KTIR for torch.transpose(x, 1, 2).contiguous() of a
 // [128, 64, 128] fp16 tensor, over the shared index space
 // [1, c // 64, c % 64, a, b] = [1, 2, 64, 128, 64]. The input's stride-1 dim
-// (c % 64) is at position 2, not at the row position 3. Checks that both views
-// swap positions 2 and 3 (sizes [1, 2, 128, 64, 64]) and the two tile loops
-// swap extents (128 and 64), that the inner one is pinned to 64, and that the
-// re-stick then follows: the source re-expressed as sizes [1, 64, 2, 128, 64]
-// in decreasing-stride order, bulk load [1, 64, 1, 1, 64], per-element
-// [.., c, t] -> [.., t, c], and the output
-// stored back through a view in decreasing-stride order. Catches the
-// unrelabelled form, which fails "dimension total size (128) is not divisible
-// by alignment factor 16384".
+// (c % 64) is at position 2, not next to the transfer's lane (b). Checks that
+// the input view is rewritten into memory order ([1, 64, 2, 128, 64], strides
+// decreasing), that the tile of c % 64 is pinned to its 64 points, and that
+// the re-stick follows: bulk load [1, 64, 1, 1, 64], one broadcast load and
+// one lane-0 store per element with the two element indices exchanged, and
+// the bulk store [1, 1, 64, 1, 64] into the output view, already in memory
+// order. Catches taking b's stride (16384) as the block length ("dimension
+// total size (128) is not divisible by alignment factor 16384").
 //
 // The input is the scheduler IR that DataTransferAlignment received for a
 // kernel that ran correctly on Spyre DD2 (exact compare against numpy), printed
@@ -22,23 +21,16 @@
 // this device matches its output on DD2 apart from those names.
 
 // CHECK-LABEL: func.func @local_schedule_0(
-// CHECK:       ktdp.construct_memory_view %arg0, sizes: [1, 2, 64, 128, 64], strides: [1048576, 8192, 1, 64, 16384]
-// CHECK:       ktdp.construct_memory_view %arg0, sizes: [1, 2, 128, 64, 64], strides: [1048576, 8192, 64, 16384, 1]
 // CHECK:       ktdp.construct_memory_view %arg0, sizes: [1, 64, 2, 128, 64], strides: [1048576, 16384, 8192, 64, 1]
-// CHECK:       ktdp.construct_memory_view %arg1, sizes: [1, 2, 128, 64, 64], strides: [1048576, 524288, 64, 8192, 1]
 // CHECK:       ktdp.construct_memory_view %arg1, sizes: [1, 2, 64, 128, 64], strides: [1048576, 524288, 8192, 64, 1]
-// CHECK:       %[[TB:.*]] = ktdf.tiling.reserve_size {divisibility = 1 : index, min_value = 1 : index} : index
-// CHECK-NEXT:  %[[T1:.*]] = ktdf.tiling.reserve_size {divisibility = 1 : index, min_value = 1 : index} : index
-// CHECK:       %[[T2:.*]] = ktdf.tiling.reserve_size {divisibility = 64 : index, min_value = 64 : index} : index
-// CHECK:       arith.ceildivui %c2{{[_0-9]*}}, %[[TB]] : index
-// CHECK:       arith.ceildivui %c128{{[_0-9]*}}, %[[T1]] : index
-// CHECK:       arith.ceildivui %c64{{[_0-9]*}}, %[[T2]] : index
-// CHECK:       ktdf.tiling.derive_size [%{{.*}} : %[[T1]]], total_size = %c128{{[_0-9]*}} : index
-// CHECK:       ktdf.tiling.derive_size [%{{.*}} : %[[T2]]], total_size = %c64{{[_0-9]*}} : index
-// CHECK:       ktdf.data_transfer from %{{.*}} size [1, 64, 1, 1, 64] to %{{.*}} size [1, 1, 1, 1, 1, 64, 64]
-// CHECK:       ktdf.data_transfer from %{{.*}}[%{{.*}}, %{{.*}}, 0, 0, 0, %[[C:arg[0-9]+]], %[[T:arg[0-9]+]]] size [1, 1, 1, 1, 1, 1, 1] to %{{.*}} size [64] {transfer_mode = "splat"}
-// CHECK:       ktdf.data_transfer from %{{.*}} size [64] to %{{.*}}[%{{.*}}, %{{.*}}, 0, 0, 0, %[[T]], %[[C]]] size [1, 1, 1, 1, 1, 1, 1]
-// CHECK:       ktdf.data_transfer from %{{.*}} size [1, 1, 1, 1, 1, 64, 64] to %{{.*}} size [1, 1, 64, 1, 64]
+// CHECK:       ktdf.tiling.reserve_size {divisibility = 1 : index, min_value = 1 : index} : index
+// CHECK-NEXT:  %[[TP:.*]] = ktdf.tiling.reserve_size {divisibility = 64 : index, min_value = 64 : index} : index
+// CHECK-NEXT:  ktdf.tiling.reserve_size {divisibility = 1 : index, min_value = 1 : index} : index
+// CHECK:       ktdf.tiling.derive_size [%{{.*}} : %[[TP]]], total_size = %c64 : index
+// CHECK:       ktdf.data_transfer from %{{.*}} size [1, 64, 1, 1, 64] to %{{.*}} size [1, 1, 1, 1, 64, 1, 64]
+// CHECK:       ktdf.data_transfer from %{{.*}}[%{{.*}}, %{{.*}}, 0, 0, %[[R:arg[0-9]+]], 0, %[[C:arg[0-9]+]]] size [1, 1, 1, 1, 1, 1, 1] to %{{.*}} size [64] {transfer_mode = "splat"}
+// CHECK:       ktdf.data_transfer from %{{.*}} size [64] to %{{.*}}[%{{.*}}, %{{.*}}, 0, 0, %[[C]], 0, %[[R]]] size [1, 1, 1, 1, 1, 1, 1] {transfer_mode = "lane0"}
+// CHECK:       ktdf.data_transfer from %{{.*}} size [1, 1, 1, 1, 64, 1, 64] to %{{.*}} size [1, 1, 64, 1, 64]
 
 #set = affine_set<(d0, d1, d2, d3, d4) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 1 >= 0, d2 >= 0, -d2 + 63 >= 0, d3 >= 0, -d3 + 127 >= 0, d4 >= 0, -d4 + 63 >= 0)>
 module {

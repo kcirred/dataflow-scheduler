@@ -1,38 +1,13 @@
-// RUN: dataflow-scheduler-opt --data-transfer-alignment %s | FileCheck %s
+// RUN: dataflow-scheduler-opt --data-transfer-alignment %s -verify-diagnostics
 
-// PURPOSE: a non-square tile. The logical [128, 256] tensor, column-major in
-// memory, is viewed as four 128x64 blocks: sizes [4, 128, 64], strides
-// [8192, 1, 128] (one block = 8192 contiguous elements, element (row, c) at
-// c * 128 + row). Checks that:
-// - the source view is read as the row-major [128][64] tile it is in memory
-//   (strides [8192, 64, 1]), not with its last two strides swapped;
-// - the per-element re-stick splits output row t = 64 * t_hi + t_lo
-//   (t_hi < 2, t_lo < 64) and loops c < 64, loading source column c from tile
-//   element [2 * c + t_hi][t_lo] (its linear position c * 128 + t, with no
-//   floordiv) and storing one element at [64 * t_hi + t_lo][c];
-// - the row tile is pinned to all 128 rows.
-// Catches PR #168's square-only loops (128 x 128 here, reading lanes past the
-// 64-lane row) and its transposed [col, row] store, which assumes a square.
-
-// CHECK-LABEL: func.func @local_schedule_0()
-// CHECK:       ktdp.construct_memory_view %c64000, sizes: [4, 128, 64], strides: [8192, 64, 1]
-// CHECK:       ktdf.tiling.reserve_size {divisibility = 1 : index, min_value = 1 : index} : index
-// CHECK:       ktdf.tiling.reserve_size {divisibility = 128 : index, min_value = 128 : index} : index
-
-// MNILU: the whole block, verbatim.
-// CHECK:       ktdf.data_transfer from %{{.*}} size [1, 128, 64] to %{{.*}} size [1, 1, 1, 128, 64]
-// CHECK:       applicable_units = ["MNILU"]
-
-// Middle stage: per element.
-// CHECK:       scf.for %[[T_HI:.*]] = %{{.*}} to %c2 step
-// CHECK:         scf.for %[[T_LO:.*]] = %{{.*}} to %c64{{[_0-9]*}} step
-// CHECK:           scf.for %[[C:.*]] = %{{.*}} to %c64{{[_0-9]*}} step
-// CHECK:             ktdf.data_transfer from %{{.*}}[%{{.*}}, %{{.*}}, 0, %[[C]] * 2 + %[[T_HI]], %[[T_LO]]] size [1, 1, 1, 1, 1] to %{{.*}} size [64] {transfer_mode = "splat"}
-// CHECK:             ktdf.data_transfer from %{{.*}} size [64] to %{{.*}}[%{{.*}}, %{{.*}}, 0, %[[T_HI]] * 64 + %[[T_LO]], %[[C]]] size [1, 1, 1, 1, 1] :
-
-// MNISU: the whole block out.
-// CHECK:       ktdf.data_transfer from %{{.*}} size [1, 1, 1, 128, 64] to %{{.*}} size [1, 128, 64]
-// CHECK:       applicable_units = ["MNISU"]
+// PURPOSE: a non-square transpose block. The logical [128, 256] tensor,
+// column-major in memory, is viewed as four 128x64 blocks: sizes [4, 128, 64],
+// strides [8192, 1, 128]. The re-stick exchanges the contiguous dim (128 long)
+// with the transfer's lane (64 long), which needs a square block, so it is
+// refused with a diagnostic at the load. Catches a rewrite that exchanges the
+// two dims anyway, which changes the view's shape and reads past the block.
+// The emitter splits every dim at the stick boundary, so its transposes always
+// use 64x64 blocks.
 
 #set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 
@@ -86,6 +61,7 @@ module {
                 %9 = ktdf.tiling.linearize_index [%arg0 : %2], [%arg2 : %c1] : index
                 scf.for %arg3 = %c0 to %7 step %c1 {
                   %10 = ktdf.tiling.linearize_index [%arg1 : %3], [%arg3 : %c1] : index
+                  // expected-error @+1 {{contiguous dim (extent 128) and transfer lane (extent 64) must have the same extent to be exchanged}}
                   ktdf.data_transfer from %cast[%9, %10, %c0 * 64] size [1, 1, 64] to %8#0[%arg2, %arg3, 0, 0, 0] size [1, 1, 1, 1, 64] {dataflow_scheduler.throttle = 64 : i64} : memref<4x128x64xf16, strided<[8192, 1, 128], offset: ?>, "DDR">, memref<?x?x1x1x64xf16, "L1">
                 } {loop_type = #ktdf.loop_type<parallel_loop>}
               } {loop_type = #ktdf.loop_type<parallel_loop>}

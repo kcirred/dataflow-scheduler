@@ -2,26 +2,24 @@
 
 // PURPOSE: a (0, 2, 1) transpose of [64, 64, 64] fp16 in the device's own
 // (stick-tiled) layout, which puts another dim between the two that swap: the
-// source tile is sizes [.., 64, 64] with strides [.., 1, 4096], so each
-// 64-element column is contiguous but columns are 4096 apart. Checks that:
-// - the widening factor is the rows' extent (64), not the innermost stride:
-//   the row tile is pinned to 64. Catches "dimension total size (64) is not
-//   divisible by alignment factor 4096";
-// - the square source tile is read column by column, its last two strides
-//   swapped ([64, 4096, 1]), then reordered by stride ([4096, 64, 1]) so the
-//   bulk load reads [c, b, r] with size [64, 1, 64]. Catches rejecting the
-//   tile as not "one contiguous column-major block";
-// - the per-element re-stick follows.
+// input view is sizes [64, 64, 64] with strides [64, 1, 4096], so each
+// 64-element column is contiguous but columns are 4096 apart. Checks that the
+// input view is rewritten into memory order ([4096, 64, 1]), that the tile of
+// the contiguous dim is pinned to its 64 points, and that the re-stick
+// follows: bulk load [64, 1, 64], one broadcast load and one lane-0 store per
+// element with the two element indices exchanged, bulk store [1, 64, 64].
+// Catches taking the lane's stride (4096) as the block length ("dimension
+// total size (64) is not divisible by alignment factor 4096").
 
 // CHECK-LABEL: func.func @local_schedule_0()
-// CHECK:       ktdp.construct_memory_view %c64000, sizes: [64, 64, 64], strides: [64, 4096, 1]
-// CHECK:       %[[SRC:.*]] = ktdp.construct_memory_view %c64000, sizes: [64, 64, 64], strides: [4096, 64, 1]
+// CHECK:       ktdp.construct_memory_view %{{.*}}, sizes: [64, 64, 64], strides: [4096, 64, 1]
+// CHECK:       ktdp.construct_memory_view %{{.*}}, sizes: [64, 64, 64], strides: [64, 4096, 1]
 // CHECK:       ktdf.tiling.reserve_size {divisibility = 1 : index, min_value = 1 : index} : index
-// CHECK:       ktdf.tiling.reserve_size {divisibility = 64 : index, min_value = 64 : index} : index
-// CHECK:       ktdf.data_transfer from %{{.*}}[%{{.*}}, %{{.*}}, %{{.*}}] size [64, 1, 64] to %{{.*}} size [1, 1, 1, 64, 64]
-// CHECK:       ktdf.data_transfer from %{{.*}}[%{{.*}}, %{{.*}}, 0, %[[C:arg[0-9]+]], %[[T:arg[0-9]+]]] size [1, 1, 1, 1, 1] to %{{.*}} size [64] {transfer_mode = "splat"}
-// CHECK:       ktdf.data_transfer from %{{.*}} size [64] to %{{.*}}[%{{.*}}, %{{.*}}, 0, %[[T]], %[[C]]] size [1, 1, 1, 1, 1]
-// CHECK:       ktdf.data_transfer from %{{.*}} size [1, 1, 1, 64, 64] to %{{.*}} size [64, 1, 64]
+// CHECK-NEXT:  ktdf.tiling.reserve_size {divisibility = 64 : index, min_value = 64 : index} : index
+// CHECK:       ktdf.data_transfer from %{{.*}} size [64, 1, 64] to %{{.*}} size [1, 1, 1, 64, 64]
+// CHECK:       ktdf.data_transfer from %{{.*}}[%{{.*}}, %{{.*}}, 0, %[[R:arg[0-9]+]], %[[C:arg[0-9]+]]] size [1, 1, 1, 1, 1] to %{{.*}} size [64] {transfer_mode = "splat"}
+// CHECK:       ktdf.data_transfer from %{{.*}} size [64] to %{{.*}}[%{{.*}}, %{{.*}}, 0, %[[C]], %[[R]]] size [1, 1, 1, 1, 1] {transfer_mode = "lane0"}
+// CHECK:       ktdf.data_transfer from %{{.*}} size [1, 1, 1, 64, 64] to %{{.*}} size [1, 64, 64]
 
 #set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 

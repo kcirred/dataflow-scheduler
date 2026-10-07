@@ -4,18 +4,23 @@
 // last, only the outer two swap. Every transfer is one legal stick, so no
 // pipeline needs widening, but the input view's strides [64, 4096, 1] do not
 // decrease, which the device compiler rejects ("Extent in load/store set is
-// larger than from the layout"). Checks that DTA still re-expresses it, as a
-// second view of the same memory in decreasing-stride order ([4096, 64, 1])
-// with the transfer's first two subscripts swapped, and leaves the transfers'
-// sizes alone. Catches skipping transfers in pipelines that need no widening.
+// larger than from the layout"). Checks that the input view is rewritten into
+// memory order ([4096, 64, 1]) with the load's first two subscripts exchanged,
+// and that the transfers' sizes and the tile-size constraints are unchanged.
+// Catches skipping views on pipelines that need no widening.
 
 // CHECK-LABEL: func.func @local_schedule_0()
-// CHECK:       %[[REORDERED:.*]] = ktdp.construct_memory_view %c64000, sizes: [64, 64, 64], strides: [4096, 64, 1]
-// CHECK:       %[[I0:.*]] = ktdf.tiling.linearize_index [%{{.*}} : %{{.*}}], [%{{.*}} : %c1] : index
-// CHECK:       %[[I1:.*]] = ktdf.tiling.linearize_index [%{{.*}} : %{{.*}}], [%{{.*}} : %c1] : index
-// CHECK:       memref.memory_space_cast %[[REORDERED]]
-// CHECK:       ktdf.data_transfer from %{{.*}}[%[[I1]], %[[I0]], %{{.*}}] size [1, 1, 64] to %{{.*}} size [1, 1, 1, 1, 64]
-// CHECK-NOT:   size [64, 1, 64]
+// CHECK:       ktdp.construct_memory_view %{{.*}}, sizes: [64, 64, 64], strides: [4096, 64, 1]
+// CHECK:       ktdp.construct_memory_view %{{.*}}, sizes: [64, 64, 64], strides: [4096, 64, 1]
+// CHECK:       ktdf.tiling.reserve_size {divisibility = 1 : index, min_value = 1 : index} : index
+// CHECK-NEXT:  ktdf.tiling.reserve_size {divisibility = 1 : index, min_value = 1 : index} : index
+// CHECK:       %[[I:.*]] = ktdf.tiling.linearize_index
+// CHECK:       %[[J:.*]] = ktdf.tiling.linearize_index
+// CHECK-NEXT:  ktdf.data_transfer from %{{.*}}[%[[J]], %[[I]], %c0 * 64] size [1, 1, 64] to %{{.*}} size [1, 1, 1, 1, 64]
+// CHECK:       ktdf.data_transfer from %{{.*}} size [1, 1, 1, 1, 64] to %{{.*}} size [64] :
+// CHECK:       ktdf.data_transfer from %{{.*}} size [64] to %{{.*}} size [1, 1, 1, 1, 64] :
+// CHECK:       ktdf.data_transfer from %{{.*}} size [1, 1, 1, 1, 64] to %{{.*}}[%{{.*}}, %{{.*}}, %c0 * 64] size [1, 1, 64]
+// CHECK-NOT:   transfer_mode
 
 #set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 

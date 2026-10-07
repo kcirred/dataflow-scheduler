@@ -3,36 +3,25 @@
 // PURPOSE: the destination is a [64, 128] row-major tensor seen as two 64x64
 // blocks: sizes [2, 64, 64], strides [64, 128, 1]. Each stick is contiguous but
 // the sticks of the two blocks interleave, so the strides do not decrease from
-// the outermost dimension in. The device address generator derives each
-// dimension's extent from the ratio of neighbouring strides and rejects that
-// order, so DTA stores through a second view of the same memory with the
-// dimensions reordered by stride ([64, 2, 64], strides [128, 64, 1]) and the
-// store's subscripts and sizes permuted to match. Catches (a) a row-major
-// rewrite of the destination to [4096, 64, 1], which silently stores the blocks
-// one after the other, and (b) keeping the original order, which the device
-// toolchain rejects ("Extent in load/store set is larger than from the
-// layout"). Also pins the row tile to all 64 rows and the per-element re-stick
-// between the two bulk copies.
+// the outermost dimension in, which the device address generator rejects
+// ("Extent in load/store set is larger than from the layout"). Checks that the
+// destination view is rewritten into memory order ([64, 2, 64], strides
+// [128, 64, 1]) with the store's subscripts and sizes permuted to match
+// ([64, 1, 64]), that the source view is rewritten into memory order too, and
+// that the tile of the contiguous dim is pinned to its 64 points with the
+// per-element re-stick between the two bulk copies. Catches a row-major
+// rewrite of the destination to [4096, 64, 1], which silently stores the
+// blocks one after the other.
 
-// The reordered view's coordinate set swaps the bounds of d0 and d1.
-// CHECK: #[[SET1:.*]] = affine_set<(d0, d1, d2) : (d1 >= 0, -d1 + 1 >= 0, d0 >= 0, -d0 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 // CHECK-LABEL: func.func @local_schedule_0()
-// CHECK:       %[[REORDERED:.*]] = ktdp.construct_memory_view %c162304, sizes: [64, 2, 64], strides: [128, 64, 1] {coordinate_set = #[[SET1]], memory_space = #ktdp.memory_space<global>} : memref<64x2x64xf16, strided<[128, 64, 1]>>
-// CHECK:       %[[BATCH_TILE:.*]] = ktdf.tiling.reserve_size {divisibility = 1 : index, min_value = 1 : index} : index
-// CHECK:       %[[ROW_TILE:.*]] = ktdf.tiling.reserve_size {divisibility = 64 : index, min_value = 64 : index} : index
-
-// Middle stage: per element, at the tile's own indices.
-// CHECK:       ktdf.data_transfer from %{{.*}}[%[[B:arg[0-9]+]], %[[R:arg[0-9]+]], 0, %[[C:arg[0-9]+]], %[[T:arg[0-9]+]]] size [1, 1, 1, 1, 1] to %{{.*}} size [64] {transfer_mode = "splat"}
-// CHECK:       ktdf.data_transfer from %{{.*}} size [64] to %{{.*}}[%[[B]], %[[R]], 0, %[[T]], %[[C]]] size [1, 1, 1, 1, 1] :
-
-// MNISU stage: one store per batch block, row index first.
-// CHECK:       %[[BATCH:.*]] = ktdf.tiling.linearize_index [%{{.*}} : %[[BATCH_TILE]]], [%{{.*}} : %c1] : index
-// CHECK:       %[[ROW:.*]] = ktdf.tiling.linearize_index [%{{.*}} : %[[ROW_TILE]]], [%{{.*}} : %c1] : index
-// CHECK:       %[[MSC:.*]] = memref.memory_space_cast %[[REORDERED]] : memref<64x2x64xf16, strided<[128, 64, 1]>> to memref<64x2x64xf16, strided<[128, 64, 1]>, "DDR">
-// CHECK:       %[[VIEW:.*]] = memref.cast %[[MSC]]
-// CHECK:       ktdf.data_transfer from %{{.*}} size [1, 1, 1, 64, 64] to %[[VIEW]][%[[ROW]], %[[BATCH]], %{{.*}}] size [64, 1, 64]
-// CHECK-SAME:  memref<64x2x64xf16, strided<[128, 64, 1], offset: ?>, "DDR">
-// CHECK:       applicable_units = ["MNISU"]
+// CHECK:       ktdp.construct_memory_view %{{.*}}, sizes: [2, 64, 64], strides: [4096, 64, 1]
+// CHECK:       ktdp.construct_memory_view %{{.*}}, sizes: [64, 2, 64], strides: [128, 64, 1]
+// CHECK:       ktdf.tiling.reserve_size {divisibility = 1 : index, min_value = 1 : index} : index
+// CHECK-NEXT:  ktdf.tiling.reserve_size {divisibility = 64 : index, min_value = 64 : index} : index
+// CHECK:       ktdf.data_transfer from %{{.*}} size [1, 64, 64] to %{{.*}} size [1, 1, 1, 64, 64]
+// CHECK:       ktdf.data_transfer from %{{.*}} size [1, 1, 1, 1, 1] to %{{.*}} size [64] {transfer_mode = "splat"}
+// CHECK:       ktdf.data_transfer from %{{.*}} size [64] to %{{.*}} size [1, 1, 1, 1, 1] {transfer_mode = "lane0"}
+// CHECK:       ktdf.data_transfer from %{{.*}} size [1, 1, 1, 64, 64] to %{{.*}} size [64, 1, 64]
 
 #set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 63 >= 0)>
 

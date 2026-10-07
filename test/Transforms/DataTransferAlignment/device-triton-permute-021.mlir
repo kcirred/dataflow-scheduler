@@ -1,14 +1,15 @@
 // RUN: dataflow-scheduler-opt --data-transfer-alignment %s | FileCheck %s
 
 // PURPOSE: Triton's tl.permute(x, (0, 2, 1)) of a [64, 64, 64] fp16 tensor in
-// torch-spyre's layout. The source tile is square with columns 4096 apart
-// (strides [.., 64, 1, 4096]). Checks that the row tile is pinned to 64, the
-// source view's last two strides are swapped and then put in decreasing order
-// ([262144, 4096, 4096, 64, 1]), the bulk load reads a [64, 1, 64] block, and
-// the per-element re-stick loads [.., c, t] and stores [.., t, c]. Catches
-// taking the innermost stride (4096) as the widening factor ("dimension total
-// size (64) is not divisible by alignment factor 4096") and rejecting the tile
-// as not one contiguous column-major block.
+// torch-spyre's layout. The input's stride-1 dim is next to the transfer's
+// lane, but its columns are 4096 apart (strides [.., 64, 1, 4096]). Checks
+// that the input view is rewritten into memory order ([.., 4096, 64, 1]),
+// that the tile of the contiguous dim is pinned to its 64 points, and that the
+// re-stick follows: bulk load [1, 1, 64, 1, 64], one broadcast load and one
+// lane-0 store per element with the two element indices exchanged, bulk store
+// [1, 1, 64, 1, 64]. Catches taking the lane's stride (4096) as the block
+// length ("dimension total size (64) is not divisible by alignment factor
+// 4096").
 //
 // The input is the scheduler IR that DataTransferAlignment received for a
 // kernel that ran correctly on Spyre DD2 (exact compare against numpy), printed
@@ -19,13 +20,13 @@
 // this device matches its output on DD2 apart from those names.
 
 // CHECK-LABEL: func.func @local_schedule_0(
-// CHECK:       ktdp.construct_memory_view %arg0, sizes: [1, 1, 64, 64, 64], strides: [262144, 4096, 4096, 64, 1]
+// CHECK:       ktdp.construct_memory_view %arg0, sizes: [1, 1, 64, 64, 64], strides: [262144, 262144, 4096, 64, 1]
 // CHECK:       ktdp.construct_memory_view %arg1, sizes: [1, 1, 64, 64, 64], strides: [262144, 4096, 4096, 64, 1]
 // CHECK:       ktdf.tiling.reserve_size {divisibility = 1 : index, min_value = 1 : index} : index
-// CHECK:       ktdf.tiling.reserve_size {divisibility = 64 : index, min_value = 64 : index} : index
+// CHECK-NEXT:  ktdf.tiling.reserve_size {divisibility = 64 : index, min_value = 64 : index} : index
 // CHECK:       ktdf.data_transfer from %{{.*}} size [1, 1, 64, 1, 64] to %{{.*}} size [1, 1, 1, 1, 1, 64, 64]
-// CHECK:       ktdf.data_transfer from %{{.*}}[%{{.*}}, %{{.*}}, 0, 0, 0, %[[C:arg[0-9]+]], %[[T:arg[0-9]+]]] size [1, 1, 1, 1, 1, 1, 1] to %{{.*}} size [64] {transfer_mode = "splat"}
-// CHECK:       ktdf.data_transfer from %{{.*}} size [64] to %{{.*}}[%{{.*}}, %{{.*}}, 0, 0, 0, %[[T]], %[[C]]] size [1, 1, 1, 1, 1, 1, 1]
+// CHECK:       ktdf.data_transfer from %{{.*}}[%{{.*}}, %{{.*}}, 0, 0, 0, %[[R:arg[0-9]+]], %[[C:arg[0-9]+]]] size [1, 1, 1, 1, 1, 1, 1] to %{{.*}} size [64] {transfer_mode = "splat"}
+// CHECK:       ktdf.data_transfer from %{{.*}} size [64] to %{{.*}}[%{{.*}}, %{{.*}}, 0, 0, 0, %[[C]], %[[R]]] size [1, 1, 1, 1, 1, 1, 1] {transfer_mode = "lane0"}
 // CHECK:       ktdf.data_transfer from %{{.*}} size [1, 1, 1, 1, 1, 64, 64] to %{{.*}} size [1, 1, 64, 1, 64]
 
 #set = affine_set<(d0, d1, d2, d3, d4) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 >= 0, d2 >= 0, -d2 + 63 >= 0, d3 >= 0, -d3 + 63 >= 0, d4 >= 0, -d4 + 63 >= 0)>
