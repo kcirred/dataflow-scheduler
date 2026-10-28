@@ -68,6 +68,10 @@ auto isSplatTransfer(ktdf::DataTransferOp transfer) -> bool;
 /// replicating the source (splat) or by zero-filling the remainder (pad).
 auto isBroadcastTransfer(ktdf::DataTransferOp transfer) -> bool;
 
+/// Whether `transfer` extracts a narrower slice out of a wider source, so the
+/// destination is smaller than the data received.
+auto isExtractTransfer(ktdf::DataTransferOp transfer) -> bool;
+
 /// Overwrite the innermost `static_source_sizes` entry of `transfer` with
 /// `size`.  Does nothing, and returns false, when `transfer` carries no static
 /// source sizes.

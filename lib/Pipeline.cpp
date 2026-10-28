@@ -105,6 +105,9 @@ void scheduler::buildSchedulerOptimizationPipeline(
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(mlir::createLoopInvariantCodeMotionPass());
   pm.addPass(mlir::ktdf::createStageCoarseningPass());
+  // Canonicalize before data-transfer-alignment to fold trivial arith ops
+  pm.addPass(mlir::createCanonicalizerPass());
+  pm.addPass(createDataTransferAlignmentPass());
   pm.addPass(mlir::ktdf::createReductionDimChunkingPass());
   pm.addPass(mlir::ktdf::createSplitReductionInnerOuterDimPass());
   pm.addPass(mlir::ktdf::createReductionLoopExposurePass());
