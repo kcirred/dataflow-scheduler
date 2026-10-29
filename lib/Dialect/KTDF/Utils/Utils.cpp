@@ -87,6 +87,7 @@ namespace {
 constexpr StringLiteral kTransferModeAttrName = "transfer_mode";
 constexpr StringLiteral kSplatTransferMode = "splat";
 constexpr StringLiteral kPadTransferMode = "pad";
+constexpr StringLiteral kExtractTransferMode = "extract";
 
 StringRef getTransferMode(ktdf::DataTransferOp transfer) {
   auto mode = llvm::dyn_cast_if_present<StringAttr>(
@@ -109,6 +110,10 @@ auto mlir::ktdf::isSplatTransfer(ktdf::DataTransferOp transfer) -> bool {
 auto mlir::ktdf::isBroadcastTransfer(ktdf::DataTransferOp transfer) -> bool {
   StringRef mode = getTransferMode(transfer);
   return mode == kSplatTransferMode || mode == kPadTransferMode;
+}
+
+auto mlir::ktdf::isExtractTransfer(ktdf::DataTransferOp transfer) -> bool {
+  return getTransferMode(transfer) == kExtractTransferMode;
 }
 
 auto mlir::ktdf::setInnermostStaticSourceSize(ktdf::DataTransferOp transfer,

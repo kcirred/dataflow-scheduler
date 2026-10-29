@@ -9,6 +9,7 @@ add_dataflow_scheduler_library(DataflowSchedulerTransforms
     IndirectAddrBufLegalization.cpp
     IndirectAccessLoopMaterialization.cpp
     AffineMinCanonicalization.cpp
+    DataTransferAlignment.cpp
     ApplyDevicePatterns.cpp
     DoubleBuffering.cpp
     EnsureDeviceDeclaration.cpp
