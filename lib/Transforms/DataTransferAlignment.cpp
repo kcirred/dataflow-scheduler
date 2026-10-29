@@ -37,12 +37,15 @@
 //     the copy to `block` x `block` tiles: the loop over dim p is pinned to one
 //     stick, the load and store move a whole tile, and the nested pipeline
 //     transposes each tile element by element (splat out of A, extract into
-//     B). The views are not rewritten.
+//     B). That transpose is the only one: the load fills row a of A with
+//     stick a of x, so it reads from x_t, a second view of x's memory with
+//     dims p and last swapped, whose last dim has stride 1. x itself is not
+//     rewritten.
 //
 // Finally every global view is listed in decreasing-stride order, with the
 // maps of the transfers on it permuted to match. That only relabels which
-// index slot addresses which dim; every address is unchanged. The device
-// compiler requires views in that order.
+// index slot addresses which dim; every address is unchanged. The re-stick is
+// correct without it; the device compiler requires views in that order.
 //
 // Ordering: after stage-coarsening + canonicalize, before double-buffering.
 //
@@ -65,10 +68,12 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/IntegerSet.h"
 #include "mlir/Pass/Pass.h"
 
@@ -145,6 +150,45 @@ llvm::SmallVector<T> permuted(llvm::ArrayRef<T> values,
   return llvm::map_to_vector(order, [&](int64_t i) { return values[i]; });
 }
 
+/// `type` with its dims listed in `order`: each dim keeps its size and stride,
+/// so every element keeps its address. The offset and memory space stay.
+mlir::FailureOr<mlir::MemRefType> permutedMemRefType(
+    mlir::MemRefType type, llvm::ArrayRef<int64_t> order) {
+  llvm::SmallVector<int64_t> strides;
+  int64_t offset;
+  if (mlir::failed(type.getStridesAndOffset(strides, offset)))
+    return mlir::failure();
+  auto layout = mlir::StridedLayoutAttr::get(
+      type.getContext(), offset, permuted(llvm::ArrayRef(strides), order));
+  return mlir::MemRefType::get(permuted(type.getShape(), order),
+                               type.getElementType(), layout,
+                               type.getMemorySpace());
+}
+
+/// `set` with its dims listed in `order`: new dim i is old dim order[i].
+mlir::IntegerSet permutedCoordinateSet(mlir::IntegerSet set,
+                                       llvm::ArrayRef<int64_t> order) {
+  mlir::MLIRContext* ctx = set.getContext();
+  llvm::SmallVector<mlir::AffineExpr> rename(order.size());
+  for (auto [new_pos, old_pos] : llvm::enumerate(order))
+    rename[old_pos] = mlir::getAffineDimExpr(new_pos, ctx);
+  return set.replaceDimsAndSymbols(rename, {}, order.size(), 0);
+}
+
+/// Lists the dims of `view` in `order`: its sizes, strides, coordinate set and
+/// result type. The ops using its result are not touched.
+void permuteViewOp(mlir::ktdp::ConstructMemoryViewOp view,
+                   llvm::ArrayRef<int64_t> order, mlir::MemRefType new_type) {
+  mlir::MLIRContext* ctx = view.getContext();
+  view.setStaticSizesAttr(mlir::DenseI64ArrayAttr::get(
+      ctx, permuted(view.getStaticSizes(), order)));
+  view.setStaticStridesAttr(mlir::DenseI64ArrayAttr::get(
+      ctx, permuted(view.getStaticStrides(), order)));
+  view.setCoordinateSetAttr(mlir::IntegerSetAttr::get(
+      permutedCoordinateSet(view.getCoordinateSet().getValue(), order)));
+  view.getResult().setType(new_type);
+}
+
 /// The index constant `value` at the start of `block`, reusing one already
 /// there so each value is defined once.
 mlir::Value indexConstant(mlir::Block* block, int64_t value,
@@ -164,12 +208,15 @@ mlir::Value indexConstant(mlir::Block* block, int64_t value,
 /// The editable operands of a ktdf.data_transfer. `rebuild` replaces the op
 /// with one built from them, keeping its discardable attributes.
 struct TransferParts {
+  mlir::Value source, destination;
   mlir::AffineMap src_map, dst_map;
   llvm::SmallVector<mlir::Value> src_indices, dst_indices;
   llvm::SmallVector<mlir::OpFoldResult> src_sizes, dst_sizes;
 
   explicit TransferParts(mlir::ktdf::DataTransferOp op)
-      : src_map(op.getSourceMap().value_or(mlir::AffineMap())),
+      : source(op.getSource()),
+        destination(op.getDestination()),
+        src_map(op.getSourceMap().value_or(mlir::AffineMap())),
         dst_map(op.getDestMap().value_or(mlir::AffineMap())),
         src_indices(op.getSourceIndices()),
         dst_indices(op.getDestIndices()),
@@ -180,8 +227,8 @@ struct TransferParts {
                                      mlir::OpBuilder& builder) const {
     builder.setInsertionPoint(op);
     auto replacement = mlir::ktdf::DataTransferOp::create(
-        builder, op.getLoc(), op.getSource(), src_map, src_indices, src_sizes,
-        op.getDestination(), dst_map, dst_indices, dst_sizes);
+        builder, op.getLoc(), source, src_map, src_indices, src_sizes,
+        destination, dst_map, dst_indices, dst_sizes);
     for (mlir::NamedAttribute attr : op->getDiscardableAttrs())
       replacement->setDiscardableAttr(attr.getName(), attr.getValue());
     op.erase();
@@ -262,6 +309,54 @@ mlir::Value indexAt(mlir::AffineMap map, mlir::ValueRange indices,
                     int64_t dim) {
   auto expr = mlir::dyn_cast<mlir::AffineDimExpr>(map.getResult(dim));
   return expr ? indices[expr.getPosition()] : mlir::Value();
+}
+
+/// Whether index `a` of the load and index `b` of the store are the same
+/// value. They are when they are one SSA value, equal constants, induction
+/// variables paired in `ivs` (the loop each stage runs over one staging-buffer
+/// dim), or results of the same op applied to such indices. Each stage
+/// recomputes its own indices, so SSA identity alone is too strict.
+bool sameIndex(mlir::Value a, mlir::Value b,
+               const llvm::DenseMap<mlir::Value, mlir::Value>& ivs) {
+  if (a == b) return true;
+  if (auto it = ivs.find(a); it != ivs.end()) return it->second == b;
+  auto ca = mlir::getConstantIntValue(a), cb = mlir::getConstantIntValue(b);
+  if (ca || cb) return ca == cb;
+  mlir::Operation *op_a = a.getDefiningOp(), *op_b = b.getDefiningOp();
+  if (!op_a || !op_b || op_a->getName() != op_b->getName() ||
+      op_a->getAttrDictionary() != op_b->getAttrDictionary() ||
+      op_a->getNumOperands() != op_b->getNumOperands() ||
+      op_a->getNumRegions() != 0 || op_b->getNumRegions() != 0 ||
+      mlir::cast<mlir::OpResult>(a).getResultNumber() !=
+          mlir::cast<mlir::OpResult>(b).getResultNumber())
+    return false;
+  return llvm::all_of(
+      llvm::zip(op_a->getOperands(), op_b->getOperands()), [&](auto pair) {
+        return sameIndex(std::get<0>(pair), std::get<1>(pair), ivs);
+      });
+}
+
+/// Whether map result `a` over the load's indices and map result `b` over the
+/// store's compute the same index: the same expression, with each pair of dims
+/// at the same position naming the same index under `sameIndex`.
+bool sameIndexExpr(mlir::AffineExpr a, mlir::ValueRange a_indices,
+                   mlir::AffineExpr b, mlir::ValueRange b_indices,
+                   const llvm::DenseMap<mlir::Value, mlir::Value>& ivs) {
+  if (a.getKind() != b.getKind()) return false;
+  if (auto dim_a = mlir::dyn_cast<mlir::AffineDimExpr>(a))
+    return sameIndex(
+        a_indices[dim_a.getPosition()],
+        b_indices[mlir::cast<mlir::AffineDimExpr>(b).getPosition()], ivs);
+  if (auto cst_a = mlir::dyn_cast<mlir::AffineConstantExpr>(a))
+    return cst_a.getValue() ==
+           mlir::cast<mlir::AffineConstantExpr>(b).getValue();
+  auto bin_a = mlir::dyn_cast<mlir::AffineBinaryOpExpr>(a);
+  auto bin_b = mlir::dyn_cast<mlir::AffineBinaryOpExpr>(b);
+  return bin_a && bin_b &&
+         sameIndexExpr(bin_a.getLHS(), a_indices, bin_b.getLHS(), b_indices,
+                       ivs) &&
+         sameIndexExpr(bin_a.getRHS(), a_indices, bin_b.getRHS(), b_indices,
+                       ivs);
 }
 
 /// Looks in `pipeline` for a copy that needs re-sticking: a transfer from a
@@ -351,6 +446,38 @@ mlir::FailureOr<std::optional<Restick>> findRestick(
                << slot << " is not " << want
                << "; the pass expects one stick per transfer";
     }
+  }
+
+  // The load and the store must address the same element in every slot:
+  // only then is the tile read from x the tile written to y. Each stage runs
+  // its own loop over a staging-buffer dim; pair the load's loop over buffer
+  // dim k with the store's.
+  int64_t lead = load.getDestMap()->getNumResults() - rank;
+  if (lead < 0 || (int64_t)store.getSourceMap()->getNumResults() - rank != lead)
+    return fail(load,
+                "the staging buffers must have the view rank plus the "
+                "same number of loop dims");
+  llvm::DenseMap<mlir::Value, mlir::Value> paired_ivs;
+  for (int64_t k = 0; k < lead; ++k) {
+    mlir::Value load_iv = indexAt(*load.getDestMap(), load.getDestIndices(), k);
+    mlir::Value store_iv =
+        indexAt(*store.getSourceMap(), store.getSourceIndices(), k);
+    if (load_iv && store_iv && load_iv != store_iv &&
+        mlir::scf::getForInductionVarOwner(load_iv) &&
+        mlir::scf::getForInductionVarOwner(store_iv))
+      paired_ivs[load_iv] = store_iv;
+  }
+  mlir::AffineMap load_map = *load.getSourceMap();
+  mlir::AffineMap store_map = *store.getDestMap();
+  for (int64_t slot = 0; slot < rank; ++slot) {
+    if (!sameIndexExpr(load_map.getResult(slot), load.getSourceIndices(),
+                       store_map.getResult(slot), store.getDestIndices(),
+                       paired_ivs))
+      return fail(store, "slot ")
+             << slot << " of the store to y does not use the same index as "
+             << "slot " << slot << " of the load from x; a re-stick needs "
+             << "the load and the store to address the same element in "
+             << "every slot";
   }
 
   mlir::ktdf::PipelineOp nested;
@@ -447,6 +574,72 @@ void resizeBuffer(StagingBuffer& buffer,
   buffer.private_op.getResult(buffer.result).setType(new_type);
 }
 
+/// Builds x_t from `x`, the load's source: the same memory as x with dims `p`
+/// and `last` swapped in sizes, strides and coordinate set, so x_t's last dim
+/// has stride 1. x's chain of view and casts is cloned, each clone right after
+/// its original; x and its users are not changed. Element [.., v, .., u] of
+/// x_t (v in slot p, u in slot last) is element [.., u, .., v] of x.
+mlir::FailureOr<mlir::Value> buildSwappedView(mlir::Value x, int64_t p,
+                                              int64_t last,
+                                              mlir::OpBuilder& builder) {
+  llvm::SmallVector<int64_t> order(last + 1);
+  std::iota(order.begin(), order.end(), 0);
+  std::swap(order[p], order[last]);
+
+  mlir::Operation* def = x.getDefiningOp();
+  auto type = mlir::dyn_cast<mlir::MemRefType>(x.getType());
+  auto new_type = type ? permutedMemRefType(type, order)
+                       : mlir::FailureOr<mlir::MemRefType>(mlir::failure());
+  if (mlir::failed(new_type))
+    return (def ? def : x.getParentBlock()->getParentOp())
+        ->emitError(PASS_NAME
+                    ": the source view has no strided "
+                    "memref type");
+
+  if (auto view =
+          mlir::dyn_cast_or_null<mlir::ktdp::ConstructMemoryViewOp>(def)) {
+    builder.setInsertionPointAfter(view);
+    auto x_t =
+        mlir::cast<mlir::ktdp::ConstructMemoryViewOp>(builder.clone(*view));
+    permuteViewOp(x_t, order, *new_type);
+    return x_t.getResult();
+  }
+  if (mlir::isa_and_nonnull<mlir::memref::CastOp,
+                            mlir::memref::MemorySpaceCastOp>(def)) {
+    auto source = buildSwappedView(def->getOperand(0), p, last, builder);
+    if (mlir::failed(source)) return mlir::failure();
+    mlir::IRMapping mapping;
+    mapping.map(def->getOperand(0), *source);
+    builder.setInsertionPointAfter(def);
+    mlir::Operation* clone = builder.clone(*def, mapping);
+    clone->getResult(0).setType(*new_type);
+    return clone->getResult(0);
+  }
+  return (def ? def : x.getParentBlock()->getParentOp())
+      ->emitError(PASS_NAME
+                  ": the source view is not a "
+                  "ktdp.construct_memory_view reached "
+                  "through memref.cast or "
+                  "memref.memory_space_cast");
+}
+
+/// Erases `value`'s defining view or cast once nothing uses it, then the one
+/// it was cast from, and so on.
+void eraseUnusedViewChain(mlir::Value value) {
+  while (mlir::Operation* def = value.getDefiningOp()) {
+    if (!def->use_empty() ||
+        !mlir::isa<mlir::ktdp::ConstructMemoryViewOp, mlir::memref::CastOp,
+                   mlir::memref::MemorySpaceCastOp>(def))
+      return;
+    mlir::Value next = mlir::isa<mlir::ktdp::ConstructMemoryViewOp>(def)
+                           ? mlir::Value()
+                           : def->getOperand(0);
+    def->erase();
+    if (!next) return;
+    value = next;
+  }
+}
+
 /// Widens the re-stick `plan` to `block` x `block` tiles. See the file
 /// comment for the shape of the result.
 mlir::LogicalResult widenRestick(Restick plan, mlir::OpBuilder& builder) {
@@ -532,6 +725,24 @@ mlir::LogicalResult widenRestick(Restick plan, mlir::OpBuilder& builder) {
 
   // 4. The load and store move a whole tile: size `block` in slot p as well
   //    as in the last slot, on both sides.
+  //
+  //    Lowering moves a transfer's last slot fastest, as the 64 lanes of one
+  //    vector, on each side. Row a of A (buffer dim lead + p = a) must then
+  //    hold stick a of x, the 64 contiguous elements x[.., p = 0..63, ..,
+  //    last = a]. So the load reads from x_t, whose last slot is x's dim p,
+  //    with its slots p and last swapped to match:
+  //
+  //      A[lead + p = a, last = b]  <-  x_t[p = a, last = b]
+  //                                  =  x[p = b, last = a]
+  //                                  =  X0 + stride_x[last] * a + b
+  //
+  //    where X0 is the address of the tile's first element. Reading x itself
+  //    would fill row a with element a of every stick (X0 + a +
+  //    stride_x[last] * b): a transpose of its own, which the splat/extract
+  //    below would undo.
+  mlir::Value x = plan.load.getSource();
+  auto x_t = buildSwappedView(x, p, last, builder);
+  if (mlir::failed(x_t)) return mlir::failure();
   for (auto [op, global_is_source] :
        {std::pair{plan.load, true}, std::pair{plan.store, false}}) {
     TransferParts parts(op);
@@ -539,8 +750,17 @@ mlir::LogicalResult widenRestick(Restick plan, mlir::OpBuilder& builder) {
         indexAttr(ctx, block);
     (global_is_source ? parts.dst_sizes : parts.src_sizes)[lead + p] =
         indexAttr(ctx, block);
+    if (global_is_source) {
+      parts.source = *x_t;
+      llvm::SmallVector<mlir::AffineExpr> results(parts.src_map.getResults());
+      std::swap(results[p], results[last]);
+      parts.src_map =
+          mlir::AffineMap::get(parts.src_map.getNumDims(), 0, results, ctx);
+      std::swap(parts.src_sizes[p], parts.src_sizes[last]);
+    }
     parts.rebuild(op, builder);
   }
+  eraseUnusedViewChain(x);
 
   // 5. The nested pipeline transposes each tile one element at a time:
   //    element (r, c) of A goes to (c, r) of B. Wrap it in loops r, c over
@@ -597,28 +817,11 @@ mlir::LogicalResult reorderView(mlir::ktdp::ConstructMemoryViewOp view,
                                 llvm::ArrayRef<int64_t> order,
                                 mlir::OpBuilder& builder) {
   mlir::MLIRContext* ctx = view.getContext();
-  auto sizes = permuted(view.getStaticSizes(), order);
-  auto strides = permuted(view.getStaticStrides(), order);
-
-  // The coordinate set bounds each dim; list its dims in the new order too.
-  mlir::IntegerSet set = view.getCoordinateSet().getValue();
-  llvm::SmallVector<mlir::AffineExpr> rename(order.size());
-  for (auto [new_pos, old_pos] : llvm::enumerate(order))
-    rename[old_pos] = mlir::getAffineDimExpr(new_pos, ctx);
-  set = set.replaceDimsAndSymbols(rename, {}, order.size(), 0);
-
-  auto old_type = mlir::cast<mlir::MemRefType>(view.getResult().getType());
-  int64_t offset = 0;
-  if (auto old_layout =
-          mlir::dyn_cast<mlir::StridedLayoutAttr>(old_type.getLayout()))
-    offset = old_layout.getOffset();
-  auto layout = mlir::StridedLayoutAttr::get(ctx, offset, strides);
-  auto new_type = mlir::MemRefType::get(sizes, old_type.getElementType(),
-                                        layout, old_type.getMemorySpace());
-  view.setStaticSizesAttr(mlir::DenseI64ArrayAttr::get(ctx, sizes));
-  view.setStaticStridesAttr(mlir::DenseI64ArrayAttr::get(ctx, strides));
-  view.setCoordinateSetAttr(mlir::IntegerSetAttr::get(set));
-  view.getResult().setType(new_type);
+  auto new_type = permutedMemRefType(
+      mlir::cast<mlir::MemRefType>(view.getResult().getType()), order);
+  if (mlir::failed(new_type))
+    return view->emitError(PASS_NAME ": the view has no strided memref type");
+  permuteViewOp(view, order, *new_type);
 
   // Carry the type through the casts, and collect the transfers on the view.
   llvm::SmallVector<std::pair<mlir::ktdf::DataTransferOp, bool>> transfers;
@@ -718,7 +921,8 @@ struct DataTransferAlignmentPass
         return signalPassFailure();
     }
 
-    if (mlir::failed(orderViewsByStride(getOperation(), memory_tree, builder)))
+    if (orderViews &&
+        mlir::failed(orderViewsByStride(getOperation(), memory_tree, builder)))
       return signalPassFailure();
   }
 };

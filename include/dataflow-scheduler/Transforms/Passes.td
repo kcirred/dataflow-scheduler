@@ -857,6 +857,12 @@ def DataTransferAlignmentPass : Pass<"data-transfer-alignment", "mlir::ModuleOp"
     Must run after stage-coarsening + canonicalize and before double-buffering.
   }];
   let constructor = "::scheduler::createDataTransferAlignmentPass()";
+  let options = [
+    Option<"orderViews", "order-views-by-stride", "bool",
+           /*default=*/"true",
+           "List every global view by decreasing stride after widening. "
+           "Off only in tests, to check the widened copy by itself">
+  ];
 }
 
 #endif // DATAFLOW_SCHEDULER_TRANSFORMS_PASSES_TD
